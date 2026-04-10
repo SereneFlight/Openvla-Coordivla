@@ -16,6 +16,9 @@ import logging
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
+# 以下两行为 CoordiVLA 新增导入
+from .coordivla_configuration import CoordiVLAConfig
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
 import numpy as np
 import timm
@@ -58,14 +61,6 @@ def ls_apply_patch(ls_module: LayerScale):
     ls_module.forward = _ls_new_forward.__get__(ls_module, LayerScale)
     del ls_module.gamma
 
-class CrossArmCoordinationModule(nn.Module):
-    """
-    跨臂协调模块:通过Self-Attention 实现左右臂的全局协调
-
-    核心机制：
-        - 将左右臂的action tokens 拼接成一个序列
-        、
-    """
 # === Prismatic Vision Backbone (nn.Module) Definitions (w/ Fused Backbone Support) ===
 class PrismaticVisionBackbone(nn.Module):
     def __init__(
@@ -136,6 +131,7 @@ class PrismaticProjector(nn.Module):
         super().__init__()
         self.use_fused_vision_backbone = use_fused_vision_backbone
         self.vision_dim, self.llm_dim = vision_dim, llm_dim
+
 
         # Switch on `use_fused_vision_backbone` =>> use slightly different MLPs and projection factors!
         if not self.use_fused_vision_backbone:
@@ -567,3 +563,343 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """Get all the logged statistics for the given dataset."""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return self.norm_stats[unnorm_key]["action"]
+@dataclass
+class CoordiVLAOutput(ModelOutput):
+    """CoordiVLA输出格式,兼容HuggingFace ModelOutput"""
+    loss: Optional[torch.FloatTensor] = None #左右臂loss之和
+    logits_left: Optional[torch.FloatTensor] = None #左臂logits（B,seq,vocab)
+    logits_right:Optional[torch.FloatTensor] = None #右臂logits（B,seq,vocab)
+
+# CrossArmCoordinationModule:两阶段跨臂协调模块
+class CrossArmCoordinationModule(nn.Module):
+    def __init__(self, hidden_size:int, num_heads: int) -> None:
+        super().__init__()
+        #左右臂各自的self-attention（先看自己内部的action序列）
+        self.self_attn_left = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.self_attn_right = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        #左右臂各自的cross-attention（再看对方的action序列）
+        self.cross_attn_left = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.cross_attn_right = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        #参差融合系数，初始化为0,在训练中逐渐学习
+        self.alpha_left = nn.Parameter(torch.zeros(1))
+        self.alpha_right = nn.Parameter(torch.zeros(1))
+
+    def forward(self, left_hidden, right_hidden, action_token_start_idx):
+        # 切出action tokens(从action_token_start_idx到末尾)
+        left_action = left_hidden[:, action_token_start_idx:, :]
+        right_action = right_hidden[:, action_token_start_idx:, :]
+        K = left_action.shape[1]
+
+        #K==0的时候multiheadAttention会报错（空序列），推理初期k为0,必须提前返回
+        if K == 0:
+            return left_hidden, right_hidden
+        
+        #因果mask，上三角为True， 表示屏蔽未来token
+        causal_mask = torch.triu(
+            torch.ones(K, K, dtype=torch.bool, device=left_hidden.device), diagonal=1)
+        
+        #第一阶段：Self-Attention， 各臂先整合自己的action序列
+        left_self, _ = self.self_attn_left(
+            left_action, left_action, left_action, attn_mask=causal_mask, need_weights=False)
+        right_self,_ = self.self_attn_right(
+            right_action, right_action, right_action, attn_mask=causal_mask, need_weights=False
+        )
+        left_cross, _ = self.cross_attn_left(
+            left_self, right_action, right_action, attn_mask=causal_mask, need_weight=False
+        )
+        right_cross, _ = self.cross_attn_right(
+            right_self, left_action, left_action, attn_mask=causal_mask, need_weights=False
+        )
+
+        #残差融合：alpha初始为0,不破坏预训练权重
+        left_new_action = left_action + self.alpha_left * left_cross
+        right_new_action = right_action + self.alpha_right * right_cross
+        #写回完整的hidden states，必须用clone，直接赋值会破坏反向传播的计算图
+        left_out = left_hidden.clone()
+        right_out = right_hidden.clone()
+        left_out[:, action_token_start_idx:, :] = left_new_action
+        right_out[:,action_token_start_idx:, :] = right_new_action
+        return left_out, right_out
+
+# CoordiVLAForActionPrediction:主模型
+# 【整体架构】
+# - 共享 vision_backbone（左右臂看同一个视觉编码器，节省显存）
+# - 独立 projector_left / projector_right（各自投影到 LLM 空间）
+# - 独立 llm_left / llm_right（各自的 7B LLM）
+# - 共享 coordination_module（在 coordination_layer 层之后插入）
+#
+# 【为什么 vision_backbone 共享？】
+# 双臂任务的视觉输入通常来自同一场景，共享编码器减少参数量，
+# 且视觉特征本身不需要区分左右臂
+#
+# 【为什么 projector 不共享？】
+# 左右臂的 LLM 权重不同（各自微调），projector 需要各自适配
+class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
+    config_class = CoordiVLAConfig
+    
+    def __init__(self, config:CoordiVLAConfig) -> None:
+        super().__init__(config)
+
+        #共享视觉编码器（DINOv2 —— SigLip融合)
+        self.vision_backbone = PrismaticVisionBackbone(
+            config.use_fused_vision_backbone, config.image_sizes, config.timm_model_ids, config.timm_override_act_layers,
+        )
+
+        #独立投影层：视觉特征->LLM隐空间
+        self.projector_left = PrismaticProjector(
+            config.use_fused_vision_backbone, vision_dim=self.vision_backbone.embed_dim,llm_dim=config.text_config.hidden_size,
+        )
+        self.projector_right = PrismaticProjector(
+            config.use_fused_vision_backbone, vision_dim=self.vision_backbone.embed_dim,llm_dim=config.text_config.hidden_size,
+        )
+        self.coordination_module = CrossArmCoordinationModule(
+            hidden_size=config.text_config.hidden_size,
+            num_heads=config.coordination_num_heads,
+        )
+
+        # 独立 LLM（各自的 7B 参数）
+        self.llm_left  = AutoModelForCausalLM.from_config(
+            config.text_config, attn_implementation=config._attn_implementation
+        )
+        self.llm_right = AutoModelForCausalLM.from_config(
+            config.text_config, attn_implementation=config._attn_implementation
+        )
+
+        self.coordination_layer = config.coordination_layer  # 在第 N 层之后插入协调
+
+        # 动作解码相关
+        self.norm_stats  = config.norm_stats
+        self.bins        = np.linspace(-1, 1, config.n_action_bins)
+        self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0
+        self.vocab_size  = config.text_config.vocab_size - config.pad_to_multiple_of
+
+        self.post_init()
+
+    def _build_multimodal_embeds(self, llm, projector, pixel_values_global, pixel_values_wrist, input_ids, attention_mask):
+        assert attention_mask is not None, "attention_mask 不能为空"
+        patch_global      = self.vision_backbone(pixel_values_global)
+        patch_wrist       = self.vision_backbone(pixel_values_wrist)
+        projected_global  = projector(patch_global)
+        projected_wrist   = projector(patch_wrist)
+        projected = torch.cat([projected_global, projected_wrist], dim=1)
+        input_embeds      = llm.get_input_embeddings()(input_ids)
+        multimodal_embeds = torch.cat(
+            [input_embeds[:, :1, :], projected, input_embeds[:, 1:, :]], dim=1
+        )
+        patch_mask = torch.ones(
+            projected.shape[0], projected.shape[1],
+            dtype=attention_mask.dtype, device=attention_mask.device
+        )
+        multimodal_mask = torch.cat(
+            [attention_mask[:, :1], patch_mask, attention_mask[:, 1:]], dim=1
+        )
+        return multimodal_embeds, multimodal_mask
+
+    def _build_multimodal_labels(self, labels, n_patch):
+        patch_ignore = torch.full(
+            (labels.shape[0], n_patch), fill_value=IGNORE_INDEX,
+            dtype=labels.dtype, device=labels.device
+        )
+        return torch.cat([labels[:, :1], patch_ignore, labels[:, 1:]], dim=1)
+
+    @staticmethod
+    def _get_action_token_start_idx(mm_labels):
+        non_ignore = (mm_labels[0] != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+        if len(non_ignore) == 0:
+            raise ValueError("labels 中没有找到非 IGNORE_INDEX 的 token")
+        return non_ignore[0].item()
+
+    def _llm_partial_forward(self, llm, inputs_embeds, attention_mask, stop_layer):
+        model = llm.model
+        B, seq_len, _ = inputs_embeds.shape
+        causal_mask  = _prepare_4d_causal_attention_mask(
+            attention_mask, (B, seq_len), inputs_embeds, past_key_values_length=0
+        )
+        position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(B, -1)
+        hidden_states = inputs_embeds
+        for idx in range(stop_layer):
+            hidden_states = model.layers[idx](
+                hidden_states, attention_mask=causal_mask, position_ids=position_ids
+            )[0]
+        return hidden_states
+
+    def _llm_final_forward(self, llm, hidden_states, attention_mask, labels, start_layer):
+        model = llm.model
+        B, seq_len, _ = hidden_states.shape
+        causal_mask  = _prepare_4d_causal_attention_mask(
+            attention_mask, (B, seq_len), hidden_states, past_key_values_length=0
+        )
+        position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(B, -1)
+        for idx in range(start_layer, len(model.layers)):
+            hidden_states = model.layers[idx](
+                hidden_states, attention_mask=causal_mask, position_ids=position_ids
+            )[0]
+        hidden_states = model.norm(hidden_states)
+        logits = llm.lm_head(hidden_states)
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous().to(logits.device)
+            loss = nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=IGNORE_INDEX
+            )
+        return loss, logits
+
+    def forward(
+        self,
+        input_ids_left=None, input_ids_right=None,
+        attention_mask_left=None, attention_mask_right=None,
+        pixel_values_global=None,
+        pixel_values_wrist_left=None, pixel_values_wrist_right=None,
+        labels_left=None, labels_right=None,
+        return_dict=None, **kwargs
+    ) -> CoordiVLAOutput:
+        assert input_ids_left is not None and input_ids_right is not None
+        assert attention_mask_left is not None and attention_mask_right is not None
+        assert pixel_values_wrist_left is not None and pixel_values_wrist_right is not None
+        assert pixel_values_global is not None 
+
+        embeds_left,  mask_left  = self._build_multimodal_embeds(
+            self.llm_left,  self.projector_left, pixel_values_global, pixel_values_wrist_left, input_ids_left,  attention_mask_left
+        )
+        embeds_right, mask_right = self._build_multimodal_embeds(
+            self.llm_right, self.projector_right, pixel_values_global, pixel_values_wrist_right, input_ids_right, attention_mask_right
+        )
+
+        n_patch = embeds_left.shape[1] - input_ids_left.shape[1]
+        mm_labels_left  = self._build_multimodal_labels(labels_left,  n_patch) if labels_left  is not None else None
+        mm_labels_right = self._build_multimodal_labels(labels_right, n_patch) if labels_right is not None else None
+
+        action_start = (
+            self._get_action_token_start_idx(mm_labels_left)
+            if mm_labels_left is not None
+            else embeds_left.shape[1]
+        )
+
+        N = self.coordination_layer
+        hidden_left  = self._llm_partial_forward(self.llm_left,  embeds_left,  mask_left,  stop_layer=N + 1)
+        hidden_right = self._llm_partial_forward(self.llm_right, embeds_right, mask_right, stop_layer=N + 1)
+
+        hidden_left, hidden_right = self.coordination_module(hidden_left, hidden_right, action_start)
+
+        loss_left,  logits_left  = self._llm_final_forward(
+            self.llm_left,  hidden_left,  mask_left,  mm_labels_left,  start_layer=N + 1
+        )
+        loss_right, logits_right = self._llm_final_forward(
+            self.llm_right, hidden_right, mask_right, mm_labels_right, start_layer=N + 1
+        )
+
+        total_loss = (
+            (loss_left + loss_right)
+            if (loss_left is not None and loss_right is not None)
+            else None
+        )
+        return CoordiVLAOutput(loss=total_loss, logits_left=logits_left, logits_right=logits_right)
+
+    def predict_action(
+        self, input_ids_left, input_ids_right, pixel_values_global,
+        pixel_values_wrist_left, pixel_values_wrist_right,
+        unnorm_key=None
+    ):
+        empty = torch.tensor([[29871]], dtype=torch.long)
+        if not torch.all(input_ids_left[:, -1] == 29871):
+            input_ids_left  = torch.cat([input_ids_left,  empty.to(input_ids_left.device)],  dim=1)
+        if not torch.all(input_ids_right[:, -1] == 29871):
+            input_ids_right = torch.cat([input_ids_right, empty.to(input_ids_right.device)], dim=1)
+
+        action_dim = self.get_action_dim(unnorm_key)
+        mask_l = torch.ones(input_ids_left.shape,  dtype=torch.long, device=input_ids_left.device)
+        mask_r = torch.ones(input_ids_right.shape, dtype=torch.long, device=input_ids_right.device)
+
+        embeds_left,  mask_left  = self._build_multimodal_embeds(
+            self.llm_left,  self.projector_left,  pixel_values_global, pixel_values_wrist_left,  input_ids_left,  mask_l
+        )
+        embeds_right, mask_right = self._build_multimodal_embeds(
+            self.llm_right, self.projector_right, pixel_values_global, pixel_values_wrist_right, input_ids_right, mask_r
+        )
+
+        assert mask_left.shape[0] == 1, "predict_action 只支持 batch size = 1"
+
+        action_start_idx = embeds_left.shape[1]
+        B = mask_left.shape[0]
+        N = self.coordination_layer
+        generated_left, generated_right = [], []
+
+        for _ in range(action_dim):
+            h_left  = self._llm_partial_forward(self.llm_left,  embeds_left,  mask_left,  stop_layer=N + 1)
+            h_right = self._llm_partial_forward(self.llm_right, embeds_right, mask_right, stop_layer=N + 1)
+            h_left, h_right = self.coordination_module(h_left, h_right, action_start_idx)
+            _, logits_left  = self._llm_final_forward(self.llm_left,  h_left,  mask_left,  None, start_layer=N + 1)
+            _, logits_right = self._llm_final_forward(self.llm_right, h_right, mask_right, None, start_layer=N + 1)
+
+            next_left  = logits_left[:,  -1, :].argmax(dim=-1, keepdim=True)
+            next_right = logits_right[:, -1, :].argmax(dim=-1, keepdim=True)
+            generated_left.append(next_left[0].item())
+            generated_right.append(next_right[0].item())
+
+            embeds_left  = torch.cat([embeds_left,  self.llm_left.get_input_embeddings()(next_left)],  dim=1)
+            embeds_right = torch.cat([embeds_right, self.llm_right.get_input_embeddings()(next_right)], dim=1)
+            mask_left  = torch.cat([mask_left,  torch.ones(B, 1, dtype=mask_left.dtype,  device=mask_left.device)],  dim=1)
+            mask_right = torch.cat([mask_right, torch.ones(B, 1, dtype=mask_right.dtype, device=mask_right.device)], dim=1)
+
+        return (
+            self._decode_action(generated_left,  unnorm_key),
+            self._decode_action(generated_right, unnorm_key)
+        )
+
+    def _decode_action(self, token_ids, unnorm_key):
+        predicted   = np.array(token_ids)
+        discretized = np.clip(
+            self.vocab_size - predicted - 1,
+            a_min=0, a_max=self.bin_centers.shape[0] - 1
+        )
+        normalized  = self.bin_centers[discretized]
+        stats  = self.get_action_stats(unnorm_key)
+        mask   = stats.get("mask", np.ones_like(stats["q01"], dtype=bool))
+        hi, lo = np.array(stats["q99"]), np.array(stats["q01"])
+        return np.where(mask, 0.5 * (normalized + 1) * (hi - lo) + lo, normalized)
+
+    def get_action_dim(self, unnorm_key=None):
+        unnorm_key = OpenVLAForActionPrediction._check_unnorm_key(self.norm_stats, unnorm_key)
+        return len(self.norm_stats[unnorm_key]["action"]["q01"])
+
+    def get_action_stats(self, unnorm_key=None):
+        unnorm_key = OpenVLAForActionPrediction._check_unnorm_key(self.norm_stats, unnorm_key)
+        return self.norm_stats[unnorm_key]["action"]
+
+    @staticmethod
+    def _check_load_coverage(module, missing_keys, threshold, module_name):
+        total_keys = list(module.state_dict().keys())
+        if len(total_keys) == 0:
+            raise RuntimeError(f"[CoordiVLA] 模块 '{module_name}' 没有可检查参数/缓冲区。")
+        hit_rate = 1.0 - len(missing_keys) / len(total_keys)
+        if hit_rate < threshold:
+            raise RuntimeError(
+                f"[CoordiVLA] 权重加载失败：'{module_name}' 命中率 {hit_rate:.1%} < 要求 {threshold:.1%}\n"
+                f"未命中参数（前5个）: {missing_keys[:5]}"
+            )
+
+    @classmethod
+    def from_single_arm_pretrained(cls, pretrained_model_name_or_path, config, **kwargs):
+        source = OpenVLAForActionPrediction.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        model  = cls(config)
+
+        res = model.vision_backbone.load_state_dict(source.vision_backbone.state_dict(), strict=False)
+        cls._check_load_coverage(model.vision_backbone, res.missing_keys, 1.0, "vision_backbone")
+
+        res = model.projector_left.load_state_dict(source.projector.state_dict(), strict=False)
+        cls._check_load_coverage(model.projector_left, res.missing_keys, 1.0, "projector_left")
+
+        res = model.projector_right.load_state_dict(source.projector.state_dict(), strict=False)
+        cls._check_load_coverage(model.projector_right, res.missing_keys, 1.0, "projector_right")
+
+        res = model.llm_left.load_state_dict(source.language_model.state_dict(), strict=False)
+        cls._check_load_coverage(model.llm_left, res.missing_keys, 0.95, "llm_left")
+
+        res = model.llm_right.load_state_dict(source.language_model.state_dict(), strict=False)
+        cls._check_load_coverage(model.llm_right, res.missing_keys, 0.95, "llm_right")
+
+        model.norm_stats = source.norm_stats
+        return model

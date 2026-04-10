@@ -3,7 +3,7 @@ Coordivia_configuration.py
 
 Coordivla的配置类，继承自OpenVLAConfig,增加双臂协调相关参数
 """
-from typing import Optional
+from typing import Any, Optional
 
 from .configuration_prismatic import OpenVLAConfig
 

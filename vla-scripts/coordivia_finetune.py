@@ -48,6 +48,32 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.extern.hf.coordivla_configuration import CoordiVLAConfig
+from prismatic.extern.hf.coordivla_modeling import CoordiVLAForActionPrediction
+
+# === HuggingFace Auto 类注册 ===
+# 注册的作用：让 AutoConfig/AutoModel 通过 model_type 字符串找到对应的类
+# 比如 config.json 里写 "model_type": "coordivla"，HF 就知道用 CoordiVLAConfig
+#
+# 为什么保留 openvla 的注册？
+# from_single_arm_pretrained 里要加载原版 OpenVLA 权重，必须先注册才能 from_pretrained
+#
+# try/except ValueError：防止脚本多次运行时重复注册报错
+try:
+    AutoConfig.register("openvla", OpenVLAConfig)
+    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+except ValueError:
+    pass  # 已经注册过，忽略
+
+try:
+    AutoConfig.register("coordivla", CoordiVLAConfig)
+    AutoImageProcessor.register(CoordiVLAConfig, PrismaticImageProcessor)
+    AutoProcessor.register(CoordiVLAConfig, PrismaticProcessor)
+    AutoModelForVision2Seq.register(CoordiVLAConfig, CoordiVLAForActionPrediction)
+except ValueError:
+    pass  # 已经注册过，忽略
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -146,12 +172,6 @@ def finetune(cfg: FinetuneConfig) -> None:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_quant_type="nf4"
         )
-
-    # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-    AutoConfig.register("openvla", OpenVLAConfig)
-    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
     # Load OpenVLA Processor and Model using HF AutoClasses
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
