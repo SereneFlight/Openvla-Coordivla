@@ -20,20 +20,26 @@ Run with:
 """
 
 import os
+import io
+import json
+import glob
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import draccus
+import h5py
 import torch
 import torch.distributed as dist
 import tqdm
+from PIL import Image
 from accelerate import PartialState
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 from transformers import AutoConfig, AutoImageProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -78,6 +84,208 @@ except ValueError:
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+IGNORE_INDEX = -100
+
+
+# ============================================================
+# RoboTwinDataset：读取 RoboTwin hdf5，返回 CoordiVLA 需要的字段
+# ============================================================
+class RoboTwinDataset(Dataset):
+
+    def __init__(self, data_dir, task_name, action_tokenizer, base_tokenizer,
+                 image_transform, prompt_builder_fn):
+        self.action_tokenizer = action_tokenizer
+        self.base_tokenizer = base_tokenizer
+        self.image_transform = image_transform
+        self.prompt_builder_fn = prompt_builder_fn
+
+        # 加载语言指令模板（只用 seen，不混入 unseen，避免评测泄漏）
+        inst_path = os.path.join(data_dir, "..", "description", "task_instruction", f"{task_name}.json")
+        inst_path = os.path.abspath(inst_path)
+        with open(inst_path, "r") as f:
+            inst_data = json.load(f)
+        self.instructions = inst_data["seen"]
+
+        # 扫描所有 episode hdf5，建立索引 [(文件路径, 时间步), ...]
+        self.samples = []
+        hdf5_dir = os.path.join(data_dir, task_name, "demo_clean", "data")
+        for hdf5_path in sorted(glob.glob(os.path.join(hdf5_dir, "episode*.hdf5"))):
+            with h5py.File(hdf5_path, "r") as ep:
+                n_steps = ep["joint_action/left_arm"].shape[0]
+            for t in range(n_steps):
+                self.samples.append((hdf5_path, t))
+
+        # 按唯一文件列表统计，避免按 self.samples 重复读同一文件 n_steps 次
+        unique_files = sorted(set(hdf5_path for hdf5_path, _ in self.samples))
+        all_left = []
+        all_right = []
+        for hdf5_path in unique_files:
+            with h5py.File(hdf5_path, "r") as f:
+                lg = f["joint_action/left_gripper"][:]
+                rg = f["joint_action/right_gripper"][:]
+                left  = np.concatenate([f["joint_action/left_arm"][:],  lg.reshape(-1, 1)],  axis=1)
+                right = np.concatenate([f["joint_action/right_arm"][:], rg.reshape(-1, 1)], axis=1)
+                all_left.append(left)
+                all_right.append(right)
+        all_left = np.concatenate(all_left, axis=0)  # (2*N*T, 7)
+        all_right = np.concatenate(all_right, axis=0)
+        self.dataset_statistics = {
+            task_name: {
+                "action": {
+                    "lq01":  np.percentile(all_left, 1,  axis=0).astype(np.float32),
+                    "lq99":  np.percentile(all_left, 99, axis=0).astype(np.float32),
+                    "mask": np.ones(7, dtype=bool),
+                    "rq01":  np.percentile(all_right, 1,  axis=0).astype(np.float32),
+                    "rq99":  np.percentile(all_right, 99,  axis=0).astype(np.float32),
+                }
+            }
+        }
+        self.lq01 = self.dataset_statistics[task_name]['action']['lq01']
+        self.lq99 = self.dataset_statistics[task_name]['action']['lq99']
+        self.rq01 = self.dataset_statistics[task_name]['action']['rq01']
+        self.rq99 = self.dataset_statistics[task_name]['action']['rq99']
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        hdf5_path, t = self.samples[idx]
+
+        with h5py.File(hdf5_path, "r") as ep:
+            # 读取三路图像：全局 + 左腕 + 右腕
+            img_global  = Image.open(io.BytesIO(bytes(ep["observation/head_camera/rgb"][t]))).convert("RGB")
+            img_wrist_l = Image.open(io.BytesIO(bytes(ep["observation/left_camera/rgb"][t]))).convert("RGB")
+            img_wrist_r = Image.open(io.BytesIO(bytes(ep["observation/right_camera/rgb"][t]))).convert("RGB")
+
+            # 读取左右臂动作：arm(6) + gripper(1) = 7 维
+            left_action = np.concatenate([
+                ep["joint_action/left_arm"][t],
+                np.array(ep["joint_action/left_gripper"][t]).reshape(1)
+            ]).astype(np.float32)
+            right_action = np.concatenate([
+                ep["joint_action/right_arm"][t],
+                np.array(ep["joint_action/right_gripper"][t]).reshape(1)
+            ]).astype(np.float32)
+
+        # 图像预处理（resize + 归一化），复用 OpenVLA 的 image_transform
+        pv_global  = self.image_transform(img_global)
+        pv_wrist_l = self.image_transform(img_wrist_l)
+        pv_wrist_r = self.image_transform(img_wrist_r)
+
+        # 随机选一条语言指令
+        lang = np.random.choice(self.instructions).lower()
+
+        # 构建 prompt + tokenize + labels（左右臂各自独立）
+        def build_ids_and_labels(action):
+            prompt_builder = self.prompt_builder_fn("openvla")
+            conversation = [
+                {"from": "human", "value": f"What action should the robot take to {lang}?"},
+                {"from": "gpt", "value": self.action_tokenizer(action)},
+            ]
+            for turn in conversation:
+                prompt_builder.add_turn(turn["from"], turn["value"])
+            input_ids = self.base_tokenizer(
+                prompt_builder.get_prompt(), add_special_tokens=True
+            ).input_ids
+            labels = list(input_ids)
+            input_ids = torch.tensor(input_ids)
+            labels = torch.tensor(labels)
+            # 只对 action token 计算 loss，其余设为 IGNORE_INDEX
+            action_mask = labels > self.action_tokenizer.action_token_begin_idx 
+            labels[~action_mask] = IGNORE_INDEX
+            return input_ids, labels
+
+        left_action_norm  = 2 * (left_action  - self.lq01) / (self.lq99 - self.lq01 + 1e-8) - 1
+        right_action_norm = 2 * (right_action - self.rq01) / (self.rq99 - self.rq01 + 1e-8) - 1
+        input_ids_left,  labels_left  = build_ids_and_labels(left_action_norm)
+        input_ids_right, labels_right = build_ids_and_labels(right_action_norm )
+
+        return dict(
+            pixel_values_global=pv_global,
+            pixel_values_wrist_left=pv_wrist_l,
+            pixel_values_wrist_right=pv_wrist_r,
+            input_ids_left=input_ids_left,
+            input_ids_right=input_ids_right,
+            labels_left=labels_left,
+            labels_right=labels_right,
+        )
+
+
+# ============================================================
+# CoordiVLACollator：把一个 batch 的样本 pad 对齐，输出 9 个字段
+# ============================================================
+# 为什么需要 Collator？
+# Dataset 返回的每个样本，input_ids 长度可能不同（不同指令文本长度不同）。
+# DataLoader 要把多个样本拼成一个 batch，必须长度一致。
+# Collator 的工作就是：短的补 padding，长的截断，同时生成 attention_mask。
+class CoordiVLACollator:
+
+    def __init__(self, max_length, pad_token_id, padding_side="right"):
+        self.max_length = max_length
+        self.pad_token_id = pad_token_id
+        self.padding_side = padding_side
+
+    def __call__(self, batch):
+        # batch 是一个 list，每个元素是 Dataset.__getitem__ 返回的 dict
+        # 例如 batch[0]["input_ids_left"] 是第 0 个样本的左臂 input_ids
+
+        # 分别收集左右臂的 input_ids 和 labels
+        ids_left  = [item["input_ids_left"]  for item in batch]
+        ids_right = [item["input_ids_right"] for item in batch]
+        lab_left  = [item["labels_left"]     for item in batch]
+        lab_right = [item["labels_right"]    for item in batch]
+
+        # pad 左臂（返回对齐后的 input_ids、attention_mask、labels）
+        ids_left_padded, mask_left, lab_left_padded = self._pad(ids_left, lab_left)
+        # pad 右臂
+        ids_right_padded, mask_right, lab_right_padded = self._pad(ids_right, lab_right)
+
+        # 图像不需要 pad，直接 stack 成 batch
+        pv_global  = torch.stack([item["pixel_values_global"]      for item in batch])
+        pv_wrist_l = torch.stack([item["pixel_values_wrist_left"]  for item in batch])
+        pv_wrist_r = torch.stack([item["pixel_values_wrist_right"] for item in batch])
+
+        # 返回模型 forward 需要的 9 个字段
+        return dict(
+            pixel_values_global=pv_global,
+            pixel_values_wrist_left=pv_wrist_l,
+            pixel_values_wrist_right=pv_wrist_r,
+            input_ids_left=ids_left_padded,
+            input_ids_right=ids_right_padded,
+            attention_mask_left=mask_left,
+            attention_mask_right=mask_right,
+            labels_left=lab_left_padded,
+            labels_right=lab_right_padded,
+        )
+
+    def _pad(self, input_ids_list, labels_list):
+        """把一组不等长的 input_ids 和 labels pad 到相同长度"""
+        # 取 batch 内最长的，但不超过 max_length
+        max_len = min(self.max_length, max(len(ids) for ids in input_ids_list))
+        padded_ids, padded_labels, masks = [], [], []
+
+        for ids, lab in zip(input_ids_list, labels_list):
+            # 超长样本截断，避免 pad_len 为负
+            ids = ids[:max_len]
+            lab = lab[:max_len]
+            pad_len = max_len - len(ids)
+            if self.padding_side == "right":
+                # 右边补 padding：[真实token ... padding]
+                p_ids = torch.cat([ids, torch.full((pad_len,), self.pad_token_id, dtype=ids.dtype)])
+                p_lab = torch.cat([lab, torch.full((pad_len,), IGNORE_INDEX, dtype=lab.dtype)])
+                mask  = torch.cat([torch.ones(len(ids), dtype=torch.long), torch.zeros(pad_len, dtype=torch.long)])
+            else:
+                # 左边补 padding：[padding ... 真实token]
+                p_ids = torch.cat([torch.full((pad_len,), self.pad_token_id, dtype=ids.dtype), ids])
+                p_lab = torch.cat([torch.full((pad_len,), IGNORE_INDEX, dtype=lab.dtype), lab])
+                mask  = torch.cat([torch.zeros(pad_len, dtype=torch.long), torch.ones(len(ids), dtype=torch.long)])
+            padded_ids.append(p_ids)
+            padded_labels.append(p_lab)
+            masks.append(mask)
+
+        # stack 成 (B, max_len) 的 tensor
+        return torch.stack(padded_ids), torch.stack(masks), torch.stack(padded_labels)
+
 
 # # === Utilities ===
 # # fmt: off
@@ -101,11 +309,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 @dataclass
 class FinetuneConfig:
     # fmt: off
-    vla_path: str = "openvla/openvla-7b"                            # Path to OpenVLA model (on HuggingFace Hub)
+    openvla_path: str = "/home/yj/desktop/openvla-7b"              # 预训练 OpenVLA 路径（用于初始化 CoordiVLA 权重）
 
     # Directory Paths
-    data_root_dir: Path = Path("datasets/open-x-embodiment")        # Path to Open-X dataset directory
-    dataset_name: str = "droid_wipe"                                # Name of fine-tuning dataset (e.g., `droid_wipe`)
+    data_dir: Path = Path("/home/yj/RoboTwin/data")                # RoboTwin 数据根目录
+    task_name: str = "beat_block_hammer"                           # 任务名
     run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
     adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
 
@@ -113,7 +321,9 @@ class FinetuneConfig:
     batch_size: int = 16                                            # Fine-tuning batch size
     max_steps: int = 200_000                                        # Max number of fine-tuning steps
     save_steps: int = 5000                                          # Interval for checkpoint saving
-    learning_rate: float = 5e-4                                     # Fine-tuning learning rate
+    learning_rate: float = 2e-4                                     # Fine-tuning learning rate（降低，避免 loss spike）
+    warmup_steps: int = 500                                         # Warmup 步数，从 0 线性升到 learning_rate
+    max_grad_norm: float = 1.0                                      # Gradient clipping，防止梯度爆炸
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
     image_aug: bool = True                                          # Whether to train with image augmentations
     shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
@@ -138,7 +348,7 @@ class FinetuneConfig:
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
-    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
+    print(f"Fine-tuning OpenVLA Model `{cfg.openvla_path}` on `{cfg.task_name}`")
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
     assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
@@ -148,7 +358,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Configure Unique Experiment ID & Log Directory
     exp_id = (
-        f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
+        f"{cfg.openvla_path.split('/')[-1]}+{cfg.task_name}"
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
         f"+lr-{cfg.learning_rate}"
     )
@@ -173,14 +383,12 @@ def finetune(cfg: FinetuneConfig) -> None:
             load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_quant_type="nf4"
         )
 
-    # Load OpenVLA Processor and Model using HF AutoClasses
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
+    # 加载 processor（从原始 OpenVLA 路径）和 CoordiVLA 模型（从单臂预训练权重初始化）
+    processor = AutoProcessor.from_pretrained(cfg.openvla_path, trust_remote_code=True)
+    vla = CoordiVLAForActionPrediction.from_single_arm_pretrained(
+        cfg.openvla_path,
+        CoordiVLAConfig.from_pretrained(cfg.openvla_path),
         torch_dtype=torch.bfloat16,
-        quantization_config=quantization_config,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
     )
 
     # Device Placement =>> note that BitsAndBytes automatically handles for quantized training
@@ -199,62 +407,61 @@ def finetune(cfg: FinetuneConfig) -> None:
             init_lora_weights="gaussian",
         )
         vla = get_peft_model(vla, lora_config)
+        for name, param in vla.named_parameters():
+            if 'alpha_left' in name or 'alpha_right' in name or 'coordination_module' in name:
+                param.requires_grad = True
         vla.print_trainable_parameters()
+
+
+    # 开启梯度检查点（必须在 get_peft_model 之后，通过 get_base_model() 访问双臂 LLM）
+    base = vla.get_base_model() if cfg.use_lora else vla
+    base.llm_left.gradient_checkpointing_enable()
+    base.llm_right.gradient_checkpointing_enable()
+    base.llm_left.config.use_cache = False
+    base.llm_right.config.use_cache = False
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
-    # Create Optimizer =>> note that we default to a simple constant learning rate!
+    # Create Optimizer，加 warmup + gradient clipping
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    # Linear warmup scheduler：前 warmup_steps 步从 0 线性升到 lr，之后保持不变
+    scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1e-8,
+        end_factor=1.0,
+        total_iters=cfg.warmup_steps,
+    )
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
-    # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
-    #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
-    #   =>> Note that our training code does not loop over epochs because the RLDS loader does this implicitly; if using
-    #       your own Dataset, make sure to add the appropriate logic to the training loop!
-    #
-    # ---
-    # from prismatic.vla.datasets import DummyDataset
-    #
-    # vla_dataset = DummyDataset(
-    #     action_tokenizer,
-    #     processor.tokenizer,
-    #     image_transform=processor.image_processor.apply_transform,
-    #     prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    # )
-    # ---
-    batch_transform = RLDSBatchTransform(
-        action_tokenizer,
-        processor.tokenizer,
+    # 构建 RoboTwin 数据集（map-style，支持 shuffle）
+    prompt_builder_fn = PurePromptBuilder if "v01" not in cfg.openvla_path else VicunaV15ChatPromptBuilder
+    vla_dataset = RoboTwinDataset(
+        data_dir=cfg.data_dir,
+        task_name=cfg.task_name,
+        action_tokenizer=action_tokenizer,
+        base_tokenizer=processor.tokenizer,
         image_transform=processor.image_processor.apply_transform,
-        prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    )
-    vla_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
+        prompt_builder_fn=prompt_builder_fn,
     )
 
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
 
-    # Create Collator and DataLoader
-    collator = PaddedCollatorForActionPrediction(
+    # 构建 CoordiVLA Collator 和 DataLoader
+    collator = CoordiVLACollator(
         processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
     )
     dataloader = DataLoader(
         vla_dataset,
         batch_size=cfg.batch_size,
-        sampler=None,
+        shuffle=True,
         collate_fn=collator,
-        num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
+        num_workers=4,
     )
 
     # Initialize Logging =>> W&B
@@ -270,122 +477,112 @@ def finetune(cfg: FinetuneConfig) -> None:
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
-        for batch_idx, batch in enumerate(dataloader):
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output: CausalLMOutputWithPast = vla(
-                    input_ids=batch["input_ids"].to(device_id),
-                    attention_mask=batch["attention_mask"].to(device_id),
-                    pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                    labels=batch["labels"],
-                )
-                loss = output.loss
-
-            # Normalize loss to account for gradient accumulation
-            normalized_loss = loss / cfg.grad_accumulation_steps
-
-            # Backward pass
-            normalized_loss.backward()
-
-            # Compute Accuracy and L1 Loss for Logging
-            action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
-            action_preds = action_logits.argmax(dim=2)
-            action_gt = batch["labels"][:, 1:].to(action_preds.device)
-            mask = action_gt > action_tokenizer.action_token_begin_idx
-
-            # Compute Accuracy
-            correct_preds = (action_preds == action_gt) & mask
-            action_accuracy = correct_preds.sum().float() / mask.sum().float()
-
-            # Compute L1 Loss on Predicted (Continuous) Actions
-            continuous_actions_pred = torch.tensor(
-                action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
-            )
-            continuous_actions_gt = torch.tensor(
-                action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
-            )
-            action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
-
-            # Store recent train metrics
-            recent_losses.append(loss.item())
-            recent_action_accuracies.append(action_accuracy.item())
-            recent_l1_losses.append(action_l1_loss.item())
-
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
-            # Compute smoothened train metrics
-            #   =>> Equal to current step metrics when not using gradient accumulation
-            #   =>> Otherwise, equal to the average of metrics observed over micro-batches used for gradient accumulation
-            smoothened_loss = sum(recent_losses) / len(recent_losses)
-            smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
-            smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
-
-            # Push Metrics to W&B (every 10 gradient steps)
-            if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
-                wandb.log(
-                    {
-                        "train_loss": smoothened_loss,
-                        "action_accuracy": smoothened_action_accuracy,
-                        "l1_loss": smoothened_l1_loss,
-                    },
-                    step=gradient_step_idx,
-                )
-
-            # Optimizer Step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-                progress.update()
-
-            # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
-            if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
-                if distributed_state.is_main_process:
-                    print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
-
-                    # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
-                    save_dir = adapter_dir if cfg.use_lora else run_dir
-
-                    # Save Processor & Weights
-                    processor.save_pretrained(run_dir)
-                    vla.module.save_pretrained(save_dir)
-
-                # Wait for processor and adapter weights to be saved by main process
-                dist.barrier()
-
-                # Merge LoRA weights into model backbone for faster inference
-                #   =>> Note that merging is slow and can be done post-hoc to speed up training
-                if cfg.use_lora:
-                    base_vla = AutoModelForVision2Seq.from_pretrained(
-                        cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+        gradient_step_idx = 0
+        epoch = 0
+        while True:
+            epoch += 1
+            for batch_idx, batch in enumerate(dataloader):
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    output = vla(
+                        pixel_values_global=batch["pixel_values_global"].to(torch.bfloat16).to(device_id),
+                        pixel_values_wrist_left=batch["pixel_values_wrist_left"].to(torch.bfloat16).to(device_id),
+                        pixel_values_wrist_right=batch["pixel_values_wrist_right"].to(torch.bfloat16).to(device_id),
+                        input_ids_left=batch["input_ids_left"].to(device_id),
+                        input_ids_right=batch["input_ids_right"].to(device_id),
+                        attention_mask_left=batch["attention_mask_left"].to(device_id),
+                        attention_mask_right=batch["attention_mask_right"].to(device_id),
+                        labels_left=batch["labels_left"].to(device_id),
+                        labels_right=batch["labels_right"].to(device_id),
                     )
-                    merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-                    merged_vla = merged_vla.merge_and_unload()
-                    if distributed_state.is_main_process:
-                        if cfg.save_latest_checkpoint_only:
-                            # Overwrite latest checkpoint
-                            merged_vla.save_pretrained(run_dir)
+                    loss = output.loss
 
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
-                        else:
-                            # Prepare to save checkpoint in new directory
-                            checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
-                            os.makedirs(checkpoint_dir, exist_ok=True)
+                # Normalize loss to account for gradient accumulation
+                normalized_loss = loss / cfg.grad_accumulation_steps
 
-                            # Save dataset statistics to new directory
-                            save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
+                # Backward pass
+                normalized_loss.backward()
 
-                            # Save processor and model weights to new directory
-                            processor.save_pretrained(checkpoint_dir)
-                            merged_vla.save_pretrained(checkpoint_dir)
+                # Compute Accuracy and L1 Loss for Logging（左右臂各算，合并统计）
+                # num_patches：全局图 + 腕部图各自的 patch 数之和
+                # 用 projector_left 的实际输出维度计算，兼容 fused backbone（DINOv2+SigLIP patch 数不同）
+                single_img_patches = vla.module.vision_backbone.featurizer.patch_embed.num_patches
+                if vla.module.vision_backbone.use_fused_vision_backbone:
+                    single_img_patches += vla.module.vision_backbone.fused_featurizer.patch_embed.num_patches
+                num_patches = single_img_patches * 2  # 全局 + 腕部
+                action_logits_left  = output.logits_left[:, num_patches + 1:-1]
+                action_logits_right = output.logits_right[:, num_patches + 1:-1]
+                action_preds_left  = action_logits_left.argmax(dim=2)
+                action_preds_right = action_logits_right.argmax(dim=2)
+                action_gt_left  = batch["labels_left"][:, 1:].to(device_id)
+                action_gt_right = batch["labels_right"][:, 1:].to(device_id)
+                mask_left  = action_gt_left  > action_tokenizer.action_token_begin_idx
+                mask_right = action_gt_right > action_tokenizer.action_token_begin_idx
 
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
+                # Compute Accuracy
+                correct_left  = (action_preds_left  == action_gt_left)  & mask_left
+                correct_right = (action_preds_right == action_gt_right) & mask_right
+                denom = (mask_left.sum() + mask_right.sum()).float()
+                action_accuracy = (correct_left.sum() + correct_right.sum()).float() / denom.clamp(min=1)
 
-                # Block on Main Process Checkpointing
-                dist.barrier()
+                # Compute L1 Loss on Predicted (Continuous) Actions
+                preds_cat = torch.cat([action_preds_left[mask_left], action_preds_right[mask_right]]).cpu().numpy()
+                gt_cat    = torch.cat([action_gt_left[mask_left],    action_gt_right[mask_right]]).cpu().numpy()
+                continuous_actions_pred = torch.tensor(action_tokenizer.decode_token_ids_to_actions(preds_cat))
+                continuous_actions_gt   = torch.tensor(action_tokenizer.decode_token_ids_to_actions(gt_cat))
+                action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
 
-            # Stop training when max_steps is reached
-            if gradient_step_idx == cfg.max_steps:
-                print(f"Max step {cfg.max_steps} reached! Stopping training...")
+                # Store recent train metrics
+                recent_losses.append(loss.item())
+                recent_action_accuracies.append(action_accuracy.item())
+                recent_l1_losses.append(action_l1_loss.item())
+
+                # Compute smoothened train metrics
+                smoothened_loss = sum(recent_losses) / len(recent_losses)
+                smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
+                smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
+
+                # Optimizer Step
+                if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(vla.parameters(), cfg.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    gradient_step_idx += 1
+                    progress.update()
+
+                    # Push Metrics to W&B (every 10 gradient steps)
+                    if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
+                        wandb.log(
+                            {
+                                "train_loss": smoothened_loss,
+                                "action_accuracy": smoothened_action_accuracy,
+                                "l1_loss": smoothened_l1_loss,
+                            },
+                            step=gradient_step_idx,
+                        )
+
+                    # Save Model Checkpoint
+                    if gradient_step_idx % cfg.save_steps == 0:
+                        if distributed_state.is_main_process:
+                            print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
+                            save_dir = adapter_dir if cfg.use_lora else run_dir
+                            processor.save_pretrained(run_dir)
+                            vla.module.save_pretrained(save_dir)
+
+                        dist.barrier()
+
+                        if cfg.use_lora:
+                            if distributed_state.is_main_process:
+                                print(f"Saved adapter checkpoint for Step {gradient_step_idx} at: {adapter_dir}")
+
+                        dist.barrier()
+
+                # Stop training when max_steps is reached
+                if gradient_step_idx >= cfg.max_steps:
+                    print(f"Max step {cfg.max_steps} reached! Stopping training...")
+                    break
+
+            if gradient_step_idx >= cfg.max_steps:
                 break
 
 

@@ -30,7 +30,7 @@ class CoordiVLAConfig(OpenVLAConfig):
         right_action_dim: int = 7,
         **kwargs: Any,
     ) -> None:
-# 保存双臂协调参数
+        # 保存双臂协调参数
         self.coordination_layer = coordination_layer
         self.coordination_num_heads = coordination_num_heads
         self.use_residual_injection = use_residual_injection

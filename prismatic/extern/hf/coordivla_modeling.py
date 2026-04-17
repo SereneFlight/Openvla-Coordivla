@@ -1,11 +1,9 @@
 """
-modeling_prismatic.py
+coordivla_modeling.py
 
-Core HuggingFace-style PrismaticPreTrainedModel and PrismaticForConditionalGeneration class definitions, inheriting
-from the default `transformers.PretrainedModel`. Meant to be standalone and self-contained, but exactly replicate the
-logic in `prismatic.models.vlms.prismatic.py`.
-
-Note =>> for the time being, not adding the custom HF "docstring" formatting.
+CoordiVLA HuggingFace-style 模型定义。
+继承自 PrismaticPreTrainedModel，实现双臂协调的 VLA 推理与训练接口。
+包含：CrossArmCoordinationModule（跨臂协调注意力）、CoordiVLAForActionPrediction（主模型）。
 
 References [LLaVa, IDEFICS-2]:
     => https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava/modeling_llava.py
@@ -605,7 +603,7 @@ class CrossArmCoordinationModule(nn.Module):
             right_action, right_action, right_action, attn_mask=causal_mask, need_weights=False
         )
         left_cross, _ = self.cross_attn_left(
-            left_self, right_action, right_action, attn_mask=causal_mask, need_weight=False
+            left_self, right_action, right_action, attn_mask=causal_mask, need_weights=False
         )
         right_cross, _ = self.cross_attn_right(
             right_self, left_action, left_action, attn_mask=causal_mask, need_weights=False
@@ -674,6 +672,14 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         self.vocab_size  = config.text_config.vocab_size - config.pad_to_multiple_of
 
         self.post_init()
+
+    def get_input_embeddings(self):
+        # PEFT 需要此方法；双臂共用同一词表，返回左臂 embedding 即可
+        return self.llm_left.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.llm_left.set_input_embeddings(value)
+        self.llm_right.set_input_embeddings(value)
 
     def _build_multimodal_embeds(self, llm, projector, pixel_values_global, pixel_values_wrist, input_ids, attention_mask):
         assert attention_mask is not None, "attention_mask 不能为空"
@@ -845,11 +851,11 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
             mask_right = torch.cat([mask_right, torch.ones(B, 1, dtype=mask_right.dtype, device=mask_right.device)], dim=1)
 
         return (
-            self._decode_action(generated_left,  unnorm_key),
-            self._decode_action(generated_right, unnorm_key)
+            self._decode_action(generated_left,  unnorm_key, arm='left'),
+            self._decode_action(generated_right, unnorm_key, arm='right')
         )
 
-    def _decode_action(self, token_ids, unnorm_key):
+    def _decode_action(self, token_ids, unnorm_key, arm):
         predicted   = np.array(token_ids)
         discretized = np.clip(
             self.vocab_size - predicted - 1,
@@ -857,13 +863,15 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         )
         normalized  = self.bin_centers[discretized]
         stats  = self.get_action_stats(unnorm_key)
-        mask   = stats.get("mask", np.ones_like(stats["q01"], dtype=bool))
-        hi, lo = np.array(stats["q99"]), np.array(stats["q01"])
-        return np.where(mask, 0.5 * (normalized + 1) * (hi - lo) + lo, normalized)
+        mask   = stats.get("mask", np.ones_like(stats["lq01"], dtype=bool))
+        left_hi, left_lo = np.array(stats["lq99"]), np.array(stats["lq01"])
+        right_hi, right_lo = np.array(stats["rq99"]), np.array(stats["rq01"])
+        return np.where(mask, 0.5 * (normalized + 1) * (left_hi - left_lo) + left_lo, normalized) if arm == 'left' else \
+            np.where(mask, 0.5 * (normalized + 1) * (right_hi - right_lo) + right_lo, normalized)
 
     def get_action_dim(self, unnorm_key=None):
         unnorm_key = OpenVLAForActionPrediction._check_unnorm_key(self.norm_stats, unnorm_key)
-        return len(self.norm_stats[unnorm_key]["action"]["q01"])
+        return len(self.norm_stats[unnorm_key]["action"]["lq01"])
 
     def get_action_stats(self, unnorm_key=None):
         unnorm_key = OpenVLAForActionPrediction._check_unnorm_key(self.norm_stats, unnorm_key)
@@ -883,8 +891,9 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
 
     @classmethod
     def from_single_arm_pretrained(cls, pretrained_model_name_or_path, config, **kwargs):
-        source = OpenVLAForActionPrediction.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        model  = cls(config)
+        dtype = kwargs.pop("torch_dtype", torch.float32)
+        source = OpenVLAForActionPrediction.from_pretrained(pretrained_model_name_or_path, torch_dtype=dtype, **kwargs)
+        model  = cls(config).to(dtype=dtype)
 
         res = model.vision_backbone.load_state_dict(source.vision_backbone.state_dict(), strict=False)
         cls._check_load_coverage(model.vision_backbone, res.missing_keys, 1.0, "vision_backbone")
