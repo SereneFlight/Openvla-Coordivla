@@ -46,21 +46,25 @@ def main():
 
     left_all  = np.concatenate(left_actions,  axis=0)  # (N, 7)
     right_all = np.concatenate(right_actions, axis=0)  # (N, 7)
-    # 左右臂拼在一起统计（训练时两臂共用同一套 norm_stats）
-    all_actions = np.concatenate([left_all, right_all], axis=0)  # (2N, 7)
-
-    q01 = np.percentile(all_actions, 1,  axis=0).tolist()
-    q99 = np.percentile(all_actions, 99, axis=0).tolist()
+    # 左右臂分开统计，与 _decode_action 里读取的 lq01/lq99/rq01/rq99 对齐
+    lq01 = np.percentile(left_all,  1,  axis=0).tolist()
+    lq99 = np.percentile(left_all,  99, axis=0).tolist()
+    rq01 = np.percentile(right_all, 1,  axis=0).tolist()
+    rq99 = np.percentile(right_all, 99, axis=0).tolist()
     mask = [True] * 7
 
-    print(f"q01: {[f'{v:.4f}' for v in q01]}")
-    print(f"q99: {[f'{v:.4f}' for v in q99]}")
+    print(f"lq01: {[f'{v:.4f}' for v in lq01]}")
+    print(f"lq99: {[f'{v:.4f}' for v in lq99]}")
+    print(f"rq01: {[f'{v:.4f}' for v in rq01]}")
+    print(f"rq99: {[f'{v:.4f}' for v in rq99]}")
 
     dataset_statistics = {
         args.task_name: {
             "action": {
-                "q01":  q01,
-                "q99":  q99,
+                "lq01": lq01,
+                "lq99": lq99,
+                "rq01": rq01,
+                "rq99": rq99,
                 "mask": mask,
             }
         }

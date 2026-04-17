@@ -41,7 +41,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/coordivia_finetu
 
 ```bash
 python vla-scripts/compute_dataset_statistics.py \
-    --data_dir /path/to/RoboTwin/data \
+    --data_dir /path/to/RoboTwin/data/handover_block/demo_clean/data \
     --task_name handover_block \
     --save_path dataset_statistics_handover_block.json
 ```
