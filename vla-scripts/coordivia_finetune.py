@@ -191,7 +191,7 @@ class RoboTwinDataset(Dataset):
             input_ids = torch.tensor(input_ids)
             labels = torch.tensor(labels)
             # 只对 action token 计算 loss，其余设为 IGNORE_INDEX
-            action_mask = labels > self.action_tokenizer.action_token_begin_idx 
+            action_mask = labels > self.action_tokenizer.action_token_begin_idx
             labels[~action_mask] = IGNORE_INDEX
             return input_ids, labels
 
@@ -321,7 +321,7 @@ class FinetuneConfig:
     batch_size: int = 16                                            # Fine-tuning batch size
     max_steps: int = 200_000                                        # Max number of fine-tuning steps
     save_steps: int = 5000                                          # Interval for checkpoint saving
-    learning_rate: float = 2e-4                                     # Fine-tuning learning rate（降低，避免 loss spike）
+    learning_rate: float = 1e-4                                     # Fine-tuning learning rate
     warmup_steps: int = 500                                         # Warmup 步数，从 0 线性升到 learning_rate
     max_grad_norm: float = 1.0                                      # Gradient clipping，防止梯度爆炸
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
@@ -335,6 +335,8 @@ class FinetuneConfig:
     use_lora: bool = True                                           # Whether to use LoRA fine-tuning
     lora_rank: int = 32                                             # Rank of LoRA weight matrix
     lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
+    use_coordination: bool = True                                   # 是否启用协调模块
+    resume_from_checkpoint: Optional[str] = None                    # adapter 目录路径，从此处续训
     use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
                                                                     #   => CAUTION: Reduces memory but hurts performance
 
@@ -387,7 +389,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     processor = AutoProcessor.from_pretrained(cfg.openvla_path, trust_remote_code=True)
     vla = CoordiVLAForActionPrediction.from_single_arm_pretrained(
         cfg.openvla_path,
-        CoordiVLAConfig.from_pretrained(cfg.openvla_path),
+        CoordiVLAConfig.from_pretrained(cfg.openvla_path, use_coordination=cfg.use_coordination),
         torch_dtype=torch.bfloat16,
     )
 
@@ -399,17 +401,29 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # [LoRA] Wrap Model w/ PEFT `LoraConfig` =>> by default we set `target_modules=all-linear`
     if cfg.use_lora:
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
-            lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
-            init_lora_weights="gaussian",
-        )
-        vla = get_peft_model(vla, lora_config)
-        for name, param in vla.named_parameters():
-            if 'alpha_left' in name or 'alpha_right' in name or 'coordination_module' in name:
-                param.requires_grad = True
+        if cfg.resume_from_checkpoint is not None:
+            # 从 checkpoint 恢复 adapter 权重
+            print(f"从 checkpoint 恢复模型: {cfg.resume_from_checkpoint}")
+            vla = PeftModel.from_pretrained(vla, cfg.resume_from_checkpoint, is_trainable=True)
+            # 恢复 coordination_module 权重（不在 LoRA adapter 里）
+            coord_path = Path(cfg.resume_from_checkpoint) / "coordination_module.pt"
+            if coord_path.exists():
+                coord_state = torch.load(coord_path, map_location="cpu")
+                missing, unexpected = vla.get_base_model().load_state_dict(coord_state, strict=False)
+                print(f"已恢复 coordination_module，missing={missing}")
+        else:
+            lora_target = [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ]
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=min(cfg.lora_rank, 16),
+                lora_dropout=cfg.lora_dropout,
+                target_modules=lora_target,
+                init_lora_weights="gaussian",
+            )
+            vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
 
@@ -423,16 +437,54 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
-    # Create Optimizer，加 warmup + gradient clipping
-    trainable_params = [param for param in vla.parameters() if param.requires_grad]
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
-    # Linear warmup scheduler：前 warmup_steps 步从 0 线性升到 lr，之后保持不变
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1e-8,
-        end_factor=1.0,
-        total_iters=cfg.warmup_steps,
+    # 手动解冻 coordination_module / alpha，LoRA 默认不训练它们
+    use_coordination = vla.module.get_base_model().use_coordination if hasattr(vla, 'module') else vla.get_base_model().use_coordination
+    if use_coordination:
+        for n, p in vla.named_parameters():
+            if 'coordination_module' in n:
+                p.requires_grad = True
+
+        # Create Optimizer，三个 param group：主干 LoRA / coord 模块 / alpha
+        alpha_params = [p for n, p in vla.named_parameters()
+                        if ('alpha_left' in n or 'alpha_right' in n) and p.requires_grad]
+        coord_params = [p for n, p in vla.named_parameters()
+                        if 'coordination_module' in n
+                        and 'alpha_left' not in n and 'alpha_right' not in n
+                        and p.requires_grad]
+        lora_params  = [p for n, p in vla.named_parameters()
+                        if 'coordination_module' not in n
+                        and 'alpha_left' not in n and 'alpha_right' not in n
+                        and p.requires_grad]
+        optimizer = AdamW([
+            {'params': lora_params,  'lr': cfg.learning_rate},
+            {'params': coord_params, 'lr': 1e-4},
+            {'params': alpha_params, 'lr': cfg.learning_rate},
+        ])
+    else:
+        lora_params = [p for p in vla.parameters() if p.requires_grad]
+        optimizer = AdamW(lora_params, lr=cfg.learning_rate)
+    # 主干 LoRA：warmup + cosine decay
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-8, end_factor=1.0, total_iters=cfg.warmup_steps
     )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.max_steps - cfg.warmup_steps, eta_min=1e-6
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[cfg.warmup_steps]
+    )
+
+    # 恢复 optimizer / scheduler / 训练步数
+    resume_step = 0
+    if cfg.resume_from_checkpoint is not None:
+        ckpt = Path(cfg.resume_from_checkpoint)
+        if (ckpt / "scheduler.pt").exists():
+            scheduler.load_state_dict(torch.load(ckpt / "scheduler.pt"))
+            print(f"已恢复 scheduler 状态")
+        if (ckpt / "training_state.json").exists():
+            with open(ckpt / "training_state.json") as f:
+                resume_step = json.load(f)["gradient_step_idx"]
+            print(f"从第 {resume_step} 步继续训练")
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -477,7 +529,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
-        gradient_step_idx = 0
+        gradient_step_idx = resume_step
+        progress.update(resume_step)
         epoch = 0
         while True:
             epoch += 1
@@ -505,12 +558,12 @@ def finetune(cfg: FinetuneConfig) -> None:
                 # Compute Accuracy and L1 Loss for Logging（左右臂各算，合并统计）
                 # num_patches：全局图 + 腕部图各自的 patch 数之和
                 # 用 projector_left 的实际输出维度计算，兼容 fused backbone（DINOv2+SigLIP patch 数不同）
-                single_img_patches = vla.module.vision_backbone.featurizer.patch_embed.num_patches
-                if vla.module.vision_backbone.use_fused_vision_backbone:
-                    single_img_patches += vla.module.vision_backbone.fused_featurizer.patch_embed.num_patches
-                num_patches = single_img_patches * 2  # 全局 + 腕部
-                action_logits_left  = output.logits_left[:, num_patches + 1:-1]
-                action_logits_right = output.logits_right[:, num_patches + 1:-1]
+                # logits shape: (B, num_patches + seq_len, vocab)
+                # labels shape: (B, seq_len)
+                # 对齐：取 logits 后 seq_len-1 个位置（shift by 1）
+                seq_len = batch["labels_left"].shape[1]
+                action_logits_left  = output.logits_left[:,  -(seq_len):-1, :]
+                action_logits_right = output.logits_right[:, -(seq_len):-1, :]
                 action_preds_left  = action_logits_left.argmax(dim=2)
                 action_preds_right = action_logits_right.argmax(dim=2)
                 action_gt_left  = batch["labels_left"][:, 1:].to(device_id)
@@ -552,22 +605,31 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                     # Push Metrics to W&B (every 10 gradient steps)
                     if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
-                        wandb.log(
-                            {
-                                "train_loss": smoothened_loss,
-                                "action_accuracy": smoothened_action_accuracy,
-                                "l1_loss": smoothened_l1_loss,
-                            },
-                            step=gradient_step_idx,
-                        )
+                        log_dict = {
+                            "train_loss": smoothened_loss,
+                            "action_accuracy": smoothened_action_accuracy,
+                            "l1_loss": smoothened_l1_loss,
+                        }
+                        if use_coordination:
+                            coord_mod = vla.module.get_base_model().coordination_module
+                            log_dict["alpha_left"]  = coord_mod.alpha_left.item()
+                            log_dict["alpha_right"] = coord_mod.alpha_right.item()
+                        wandb.log(log_dict, step=gradient_step_idx)
 
                     # Save Model Checkpoint
                     if gradient_step_idx % cfg.save_steps == 0:
                         if distributed_state.is_main_process:
                             print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
-                            save_dir = adapter_dir if cfg.use_lora else run_dir
+                            save_dir = (adapter_dir if cfg.use_lora else run_dir) / f"step-{gradient_step_idx}"
                             processor.save_pretrained(run_dir)
                             vla.module.save_pretrained(save_dir)
+                            torch.save(scheduler.state_dict(), save_dir / "scheduler.pt")
+                            with open(save_dir / "training_state.json", "w") as f:
+                                json.dump({"gradient_step_idx": gradient_step_idx}, f)
+                            if use_coordination:
+                                coord_state = {n: p for n, p in vla.module.get_base_model().named_parameters()
+                                               if 'coordination_module' in n or 'alpha_left' in n or 'alpha_right' in n}
+                                torch.save(coord_state, save_dir / "coordination_module.pt")
 
                         dist.barrier()
 

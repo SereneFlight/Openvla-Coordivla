@@ -26,14 +26,16 @@ class CoordiVLAConfig(OpenVLAConfig):
         coordination_layer: Optional[int] = None,
         coordination_num_heads: int = 8,
         use_residual_injection: bool = True,
+        use_coordination: bool = True,
         left_action_dim: int = 7,
         right_action_dim: int = 7,
         **kwargs: Any,
     ) -> None:
-        # 保存双臂协调参数
+# 保存双臂协调参数
         self.coordination_layer = coordination_layer
         self.coordination_num_heads = coordination_num_heads
         self.use_residual_injection = use_residual_injection
+        self.use_coordination = use_coordination
         self.left_action_dim = left_action_dim
         self.right_action_dim = right_action_dim
         

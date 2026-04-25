@@ -568,55 +568,64 @@ class CoordiVLAOutput(ModelOutput):
     logits_left: Optional[torch.FloatTensor] = None #左臂logits（B,seq,vocab)
     logits_right:Optional[torch.FloatTensor] = None #右臂logits（B,seq,vocab)
 
-# CrossArmCoordinationModule:两阶段跨臂协调模块
-class CrossArmCoordinationModule(nn.Module):
-    def __init__(self, hidden_size:int, num_heads: int) -> None:
+# 单层协调块：self-attn + cross-attn
+class CoordinationLayer(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int) -> None:
         super().__init__()
-        #左右臂各自的self-attention（先看自己内部的action序列）
-        self.self_attn_left = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.self_attn_left  = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
         self.self_attn_right = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-        #左右臂各自的cross-attention（再看对方的action序列）
-        self.cross_attn_left = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.cross_attn_left  = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
         self.cross_attn_right = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-        #参差融合系数，初始化为0,在训练中逐渐学习
-        self.alpha_left = nn.Parameter(torch.zeros(1))
-        self.alpha_right = nn.Parameter(torch.zeros(1))
+
+    def forward(self, left_action, right_action, causal_mask):
+        left_self,  _ = self.self_attn_left(
+            left_action, left_action, left_action, attn_mask=causal_mask, need_weights=False)
+        right_self, _ = self.self_attn_right(
+            right_action, right_action, right_action, attn_mask=causal_mask, need_weights=False)
+        left_out,  _ = self.cross_attn_left(
+            left_self, right_action, right_action, need_weights=False)
+        right_out, _ = self.cross_attn_right(
+            right_self, left_action, left_action, need_weights=False)
+        # 残差
+        left_action  = left_action  + left_out
+        right_action = right_action + right_out
+        return left_action, right_action
+
+
+# CrossArmCoordinationModule:多层跨臂协调模块
+class CrossArmCoordinationModule(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, num_layers: int = 3) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [CoordinationLayer(hidden_size, num_heads) for _ in range(num_layers)]
+        )
+        self.alpha_left  = nn.Parameter(torch.ones(1))   # 初始值 1.0
+        self.alpha_right = nn.Parameter(torch.ones(1))   # 初始值 1.0
 
     def forward(self, left_hidden, right_hidden, action_token_start_idx):
-        # 切出action tokens(从action_token_start_idx到末尾)
-        left_action = left_hidden[:, action_token_start_idx:, :]
+        left_action  = left_hidden[:, action_token_start_idx:, :]
         right_action = right_hidden[:, action_token_start_idx:, :]
         K = left_action.shape[1]
 
-        #K==0的时候multiheadAttention会报错（空序列），推理初期k为0,必须提前返回
         if K == 0:
             return left_hidden, right_hidden
-        
-        #因果mask，上三角为True， 表示屏蔽未来token
+
         causal_mask = torch.triu(
             torch.ones(K, K, dtype=torch.bool, device=left_hidden.device), diagonal=1)
-        
-        #第一阶段：Self-Attention， 各臂先整合自己的action序列
-        left_self, _ = self.self_attn_left(
-            left_action, left_action, left_action, attn_mask=causal_mask, need_weights=False)
-        right_self,_ = self.self_attn_right(
-            right_action, right_action, right_action, attn_mask=causal_mask, need_weights=False
-        )
-        left_cross, _ = self.cross_attn_left(
-            left_self, right_action, right_action, attn_mask=causal_mask, need_weights=False
-        )
-        right_cross, _ = self.cross_attn_right(
-            right_self, left_action, left_action, attn_mask=causal_mask, need_weights=False
-        )
 
-        #残差融合：alpha初始为0,不破坏预训练权重
-        left_new_action = left_action + self.alpha_left * left_cross
-        right_new_action = right_action + self.alpha_right * right_cross
-        #写回完整的hidden states，必须用clone，直接赋值会破坏反向传播的计算图
-        left_out = left_hidden.clone()
+        left_orig  = left_action
+        right_orig = right_action
+        for layer in self.layers:
+            left_action, right_action = layer(left_action, right_action, causal_mask)
+
+        # 最终残差融合
+        left_new_action  = left_orig  + self.alpha_left  * left_action
+        right_new_action = right_orig + self.alpha_right * right_action
+
+        left_out  = left_hidden.clone()
         right_out = right_hidden.clone()
-        left_out[:, action_token_start_idx:, :] = left_new_action
-        right_out[:,action_token_start_idx:, :] = right_new_action
+        left_out[:,  action_token_start_idx:, :] = left_new_action
+        right_out[:, action_token_start_idx:, :] = right_new_action
         return left_out, right_out
 
 # CoordiVLAForActionPrediction:主模型
@@ -650,10 +659,12 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         self.projector_right = PrismaticProjector(
             config.use_fused_vision_backbone, vision_dim=self.vision_backbone.embed_dim,llm_dim=config.text_config.hidden_size,
         )
-        self.coordination_module = CrossArmCoordinationModule(
-            hidden_size=config.text_config.hidden_size,
-            num_heads=config.coordination_num_heads,
-        )
+        self.use_coordination = config.use_coordination
+        if self.use_coordination:
+            self.coordination_module = CrossArmCoordinationModule(
+                hidden_size=config.text_config.hidden_size,
+                num_heads=config.coordination_num_heads,
+            )
 
         # 独立 LLM（各自的 7B 参数）
         self.llm_left  = AutoModelForCausalLM.from_config(
@@ -710,10 +721,25 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
 
     @staticmethod
     def _get_action_token_start_idx(mm_labels):
-        non_ignore = (mm_labels[0] != IGNORE_INDEX).nonzero(as_tuple=True)[0]
-        if len(non_ignore) == 0:
-            raise ValueError("labels 中没有找到非 IGNORE_INDEX 的 token")
-        return non_ignore[0].item()
+        # 返回每个样本各自的 action 起点，List[int]，长度=B
+        starts = []
+        for i in range(mm_labels.shape[0]):
+            non_ignore = (mm_labels[i] != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+            if len(non_ignore) == 0:
+                raise ValueError(f"sample {i}: labels 中没有找到非 IGNORE_INDEX 的 token")
+            starts.append(non_ignore[0].item())
+        return starts
+
+    def _apply_coordination_per_sample(self, hidden_left, hidden_right, action_starts):
+        # 对 batch 内每个样本单独做 coordination，避免不同样本 action_start 不一致
+        outs_left, outs_right = [], []
+        for b, s in enumerate(action_starts):
+            hl, hr = self.coordination_module(
+                hidden_left[b:b+1], hidden_right[b:b+1], s
+            )
+            outs_left.append(hl)
+            outs_right.append(hr)
+        return torch.cat(outs_left, dim=0), torch.cat(outs_right, dim=0)
 
     def _llm_partial_forward(self, llm, inputs_embeds, attention_mask, stop_layer):
         model = llm.model
@@ -778,17 +804,17 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         mm_labels_left  = self._build_multimodal_labels(labels_left,  n_patch) if labels_left  is not None else None
         mm_labels_right = self._build_multimodal_labels(labels_right, n_patch) if labels_right is not None else None
 
-        action_start = (
-            self._get_action_token_start_idx(mm_labels_left)
-            if mm_labels_left is not None
-            else embeds_left.shape[1]
-        )
+        if mm_labels_left is not None:
+            action_starts = self._get_action_token_start_idx(mm_labels_left)  # List[int], len=B
+        else:
+            action_starts = [embeds_left.shape[1]] * embeds_left.shape[0]
 
         N = self.coordination_layer
         hidden_left  = self._llm_partial_forward(self.llm_left,  embeds_left,  mask_left,  stop_layer=N + 1)
         hidden_right = self._llm_partial_forward(self.llm_right, embeds_right, mask_right, stop_layer=N + 1)
 
-        hidden_left, hidden_right = self.coordination_module(hidden_left, hidden_right, action_start)
+        if self.use_coordination:
+            hidden_left, hidden_right = self._apply_coordination_per_sample(hidden_left, hidden_right, action_starts)
 
         loss_left,  logits_left  = self._llm_final_forward(
             self.llm_left,  hidden_left,  mask_left,  mm_labels_left,  start_layer=N + 1
@@ -836,10 +862,15 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         for _ in range(action_dim):
             h_left  = self._llm_partial_forward(self.llm_left,  embeds_left,  mask_left,  stop_layer=N + 1)
             h_right = self._llm_partial_forward(self.llm_right, embeds_right, mask_right, stop_layer=N + 1)
-            h_left, h_right = self.coordination_module(h_left, h_right, action_start_idx)
+            if self.use_coordination:
+                h_left, h_right = self.coordination_module(h_left, h_right, action_start_idx)
             _, logits_left  = self._llm_final_forward(self.llm_left,  h_left,  mask_left,  None, start_layer=N + 1)
             _, logits_right = self._llm_final_forward(self.llm_right, h_right, mask_right, None, start_layer=N + 1)
 
+            # 只允许从合法 action token 里选，屏蔽文字 token 避免极值动作
+            action_token_begin = self.vocab_size - self.bin_centers.shape[0]
+            logits_left[:,  -1, :action_token_begin] = float('-inf')
+            logits_right[:, -1, :action_token_begin] = float('-inf')
             next_left  = logits_left[:,  -1, :].argmax(dim=-1, keepdim=True)
             next_right = logits_right[:, -1, :].argmax(dim=-1, keepdim=True)
             generated_left.append(next_left[0].item())
