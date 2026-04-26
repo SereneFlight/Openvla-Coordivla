@@ -867,10 +867,12 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
             _, logits_left  = self._llm_final_forward(self.llm_left,  h_left,  mask_left,  None, start_layer=N + 1)
             _, logits_right = self._llm_final_forward(self.llm_right, h_right, mask_right, None, start_layer=N + 1)
 
-            # 只允许从合法 action token 里选，屏蔽文字 token 避免极值动作
-            action_token_begin = self.vocab_size - self.bin_centers.shape[0]
+            # 只允许从合法 action token 里选，屏蔽文字 token 和 padding token
+            action_token_begin = self.vocab_size - (self.bin_centers.shape[0] + 1)
             logits_left[:,  -1, :action_token_begin] = float('-inf')
             logits_right[:, -1, :action_token_begin] = float('-inf')
+            logits_left[:,  -1, self.vocab_size:] = float('-inf')
+            logits_right[:, -1, self.vocab_size:] = float('-inf')
             next_left  = logits_left[:,  -1, :].argmax(dim=-1, keepdim=True)
             next_right = logits_right[:, -1, :].argmax(dim=-1, keepdim=True)
             generated_left.append(next_left[0].item())
