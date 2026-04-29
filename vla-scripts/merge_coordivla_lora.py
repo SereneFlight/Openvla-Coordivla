@@ -46,12 +46,13 @@ def main():
     parser.add_argument("--adapter_dir",   type=str, required=True, help="LoRA adapter 保存路径")
     parser.add_argument("--save_dir",      type=str, required=True, help="merge 后完整权重保存路径")
     parser.add_argument("--stats_path",    type=str, default=None,  help="dataset_statistics.json 路径（由 compute_dataset_statistics.py 生成）")
+    parser.add_argument("--use_coordination", type=str, default="True", help="是否启用协调模块（与训练时一致）")
     args = parser.parse_args()
 
     print(f"加载 base 模型: {args.openvla_path}")
     base_vla = CoordiVLAForActionPrediction.from_single_arm_pretrained(
         args.openvla_path,
-        CoordiVLAConfig.from_pretrained(args.openvla_path),
+        CoordiVLAConfig.from_pretrained(args.openvla_path, use_coordination=(args.use_coordination.lower() == "true")),
         torch_dtype=torch.bfloat16,
     )
 

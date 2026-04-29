@@ -42,6 +42,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 from transformers import AutoConfig, AutoImageProcessor
+from torchvision import transforms as T
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
@@ -93,11 +94,15 @@ IGNORE_INDEX = -100
 class RoboTwinDataset(Dataset):
 
     def __init__(self, data_dir, task_name, action_tokenizer, base_tokenizer,
-                 image_transform, prompt_builder_fn):
+                 image_transform, prompt_builder_fn, image_aug=False):
         self.action_tokenizer = action_tokenizer
         self.base_tokenizer = base_tokenizer
         self.image_transform = image_transform
         self.prompt_builder_fn = prompt_builder_fn
+        self.aug = T.Compose([
+            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+            T.RandomGrayscale(p=0.05),
+        ]) if image_aug else None
 
         # 加载语言指令模板（只用 seen，不混入 unseen，避免评测泄漏）
         inst_path = os.path.join(data_dir, "..", "description", "task_instruction", f"{task_name}.json")
@@ -168,6 +173,10 @@ class RoboTwinDataset(Dataset):
             ]).astype(np.float32)
 
         # 图像预处理（resize + 归一化），复用 OpenVLA 的 image_transform
+        if self.aug is not None:
+            img_global  = self.aug(img_global)
+            img_wrist_l = self.aug(img_wrist_l)
+            img_wrist_r = self.aug(img_wrist_r)
         pv_global  = self.image_transform(img_global)
         pv_wrist_l = self.image_transform(img_wrist_l)
         pv_wrist_r = self.image_transform(img_wrist_r)
@@ -336,12 +345,11 @@ class FinetuneConfig:
     lora_rank: int = 32                                             # Rank of LoRA weight matrix
     lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
     use_coordination: bool = True                                   # 是否启用协调模块
-    resume_from_checkpoint: Optional[str] = None                    # adapter 目录路径，从此处续训
     use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
                                                                     #   => CAUTION: Reduces memory but hurts performance
 
     # Tracking Parameters
-    wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
+    wandb_project: str = "coordivla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
 
@@ -401,30 +409,26 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # [LoRA] Wrap Model w/ PEFT `LoraConfig` =>> by default we set `target_modules=all-linear`
     if cfg.use_lora:
-        if cfg.resume_from_checkpoint is not None:
-            # 从 checkpoint 恢复 adapter 权重
-            print(f"从 checkpoint 恢复模型: {cfg.resume_from_checkpoint}")
-            vla = PeftModel.from_pretrained(vla, cfg.resume_from_checkpoint, is_trainable=True)
-            # 恢复 coordination_module 权重（不在 LoRA adapter 里）
-            coord_path = Path(cfg.resume_from_checkpoint) / "coordination_module.pt"
-            if coord_path.exists():
-                coord_state = torch.load(coord_path, map_location="cpu")
-                missing, unexpected = vla.get_base_model().load_state_dict(coord_state, strict=False)
-                print(f"已恢复 coordination_module，missing={missing}")
-        else:
-            lora_target = [
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            ]
-            lora_config = LoraConfig(
-                r=cfg.lora_rank,
-                lora_alpha=min(cfg.lora_rank, 16),
-                lora_dropout=cfg.lora_dropout,
-                target_modules=lora_target,
-                init_lora_weights="gaussian",
-            )
-            vla = get_peft_model(vla, lora_config)
+        # 只对 LLM 主干线性层做 LoRA，coordination_module 排除在外（后面手动解冻全参数更新）
+        lora_target = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ]
+        lora_config = LoraConfig(
+            r=cfg.lora_rank,
+            lora_alpha=min(cfg.lora_rank, 16),
+            lora_dropout=cfg.lora_dropout,
+            target_modules=lora_target,
+            init_lora_weights="gaussian",
+        )
+        vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+        # 验证 coord 模块是否被 LoRA 包住（应全为 False）
+        print("=== coord module requires_grad before unfreeze ===")
+        for n, p in vla.named_parameters():
+            if 'coordination_module' in n:
+                print(n, p.requires_grad)
+        print("=== end ===")
 
 
     # 开启梯度检查点（必须在 get_peft_model 之后，通过 get_base_model() 访问双臂 LLM）
@@ -474,18 +478,6 @@ def finetune(cfg: FinetuneConfig) -> None:
         optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[cfg.warmup_steps]
     )
 
-    # 恢复 optimizer / scheduler / 训练步数
-    resume_step = 0
-    if cfg.resume_from_checkpoint is not None:
-        ckpt = Path(cfg.resume_from_checkpoint)
-        if (ckpt / "scheduler.pt").exists():
-            scheduler.load_state_dict(torch.load(ckpt / "scheduler.pt"))
-            print(f"已恢复 scheduler 状态")
-        if (ckpt / "training_state.json").exists():
-            with open(ckpt / "training_state.json") as f:
-                resume_step = json.load(f)["gradient_step_idx"]
-            print(f"从第 {resume_step} 步继续训练")
-
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
@@ -498,6 +490,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         base_tokenizer=processor.tokenizer,
         image_transform=processor.image_processor.apply_transform,
         prompt_builder_fn=prompt_builder_fn,
+        image_aug=cfg.image_aug,
     )
 
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
@@ -529,8 +522,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
-        gradient_step_idx = resume_step
-        progress.update(resume_step)
+        gradient_step_idx = 0
         epoch = 0
         while True:
             epoch += 1
@@ -620,16 +612,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                     if gradient_step_idx % cfg.save_steps == 0:
                         if distributed_state.is_main_process:
                             print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
-                            save_dir = (adapter_dir if cfg.use_lora else run_dir) / f"step-{gradient_step_idx}"
+                            save_dir = adapter_dir if cfg.use_lora else run_dir
                             processor.save_pretrained(run_dir)
                             vla.module.save_pretrained(save_dir)
-                            torch.save(scheduler.state_dict(), save_dir / "scheduler.pt")
-                            with open(save_dir / "training_state.json", "w") as f:
-                                json.dump({"gradient_step_idx": gradient_step_idx}, f)
-                            if use_coordination:
-                                coord_state = {n: p for n, p in vla.module.get_base_model().named_parameters()
-                                               if 'coordination_module' in n or 'alpha_left' in n or 'alpha_right' in n}
-                                torch.save(coord_state, save_dir / "coordination_module.pt")
 
                         dist.barrier()
 
@@ -646,6 +631,14 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             if gradient_step_idx >= cfg.max_steps:
                 break
+
+    # 训练结束后强制保存最终 checkpoint（避免 max_steps 不是 save_steps 整数倍时丢失最后几步）
+    if distributed_state.is_main_process:
+        print(f"Saving final checkpoint at step {gradient_step_idx}")
+        save_dir = adapter_dir if cfg.use_lora else run_dir
+        processor.save_pretrained(run_dir)
+        vla.module.save_pretrained(save_dir)
+    dist.barrier()
 
 
 if __name__ == "__main__":
