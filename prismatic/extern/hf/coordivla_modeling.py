@@ -568,27 +568,63 @@ class CoordiVLAOutput(ModelOutput):
     logits_left: Optional[torch.FloatTensor] = None #左臂logits（B,seq,vocab)
     logits_right:Optional[torch.FloatTensor] = None #右臂logits（B,seq,vocab)
 
-# 单层协调块：self-attn + cross-attn
+# 单层协调块：self-attn + cross-attn + FFN，标准 Pre-LN Transformer 结构
 class CoordinationLayer(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int) -> None:
+    def __init__(self, hidden_size: int, num_heads: int, ffn_dim: int = None) -> None:
         super().__init__()
+        ffn_dim = ffn_dim or 1024
         self.self_attn_left  = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
         self.self_attn_right = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
         self.cross_attn_left  = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
         self.cross_attn_right = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
 
-    def forward(self, left_action, right_action, causal_mask):
+        self.norm_self_left   = nn.LayerNorm(hidden_size)
+        self.norm_self_right  = nn.LayerNorm(hidden_size)
+        self.norm_cross_left  = nn.LayerNorm(hidden_size)
+        self.norm_cross_right = nn.LayerNorm(hidden_size)
+        self.norm_ffn_left    = nn.LayerNorm(hidden_size)
+        self.norm_ffn_right   = nn.LayerNorm(hidden_size)
+
+        self.ffn_left  = nn.Sequential(
+            nn.Linear(hidden_size, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_size))
+        self.ffn_right = nn.Sequential(
+            nn.Linear(hidden_size, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_size))
+
+    def forward(self, left_action, right_action, causal_mask, return_weights=False):
+        # self-attn (Pre-LN + 残差)
         left_self,  _ = self.self_attn_left(
-            left_action, left_action, left_action, attn_mask=causal_mask, need_weights=False)
+            self.norm_self_left(left_action),
+            self.norm_self_left(left_action),
+            self.norm_self_left(left_action),
+            attn_mask=causal_mask, need_weights=False)
         right_self, _ = self.self_attn_right(
-            right_action, right_action, right_action, attn_mask=causal_mask, need_weights=False)
-        left_out,  _ = self.cross_attn_left(
-            left_self, right_action, right_action, need_weights=False)
-        right_out, _ = self.cross_attn_right(
-            right_self, left_action, left_action, need_weights=False)
-        # 残差
+            self.norm_self_right(right_action),
+            self.norm_self_right(right_action),
+            self.norm_self_right(right_action),
+            attn_mask=causal_mask, need_weights=False)
+        left_action  = left_action  + left_self
+        right_action = right_action + right_self
+
+        # cross-attn (Pre-LN + 残差)
+        left_out,  left_attn_w  = self.cross_attn_left(
+            self.norm_cross_left(left_action),
+            self.norm_cross_right(right_action),
+            self.norm_cross_right(right_action),
+            need_weights=return_weights)
+        right_out, right_attn_w = self.cross_attn_right(
+            self.norm_cross_right(right_action),
+            self.norm_cross_left(left_action),
+            self.norm_cross_left(left_action),
+            need_weights=return_weights)
         left_action  = left_action  + left_out
         right_action = right_action + right_out
+
+        # FFN (Pre-LN + 残差)
+        left_action  = left_action  + self.ffn_left(self.norm_ffn_left(left_action))
+        right_action = right_action + self.ffn_right(self.norm_ffn_right(right_action))
+
+        if return_weights:
+            return left_action, right_action, left_attn_w, right_attn_w
         return left_action, right_action
 
 
@@ -599,8 +635,22 @@ class CrossArmCoordinationModule(nn.Module):
         self.layers = nn.ModuleList(
             [CoordinationLayer(hidden_size, num_heads) for _ in range(num_layers)]
         )
-        self.alpha_left  = nn.Parameter(torch.ones(1))   # 初始值 1.0
-        self.alpha_right = nn.Parameter(torch.ones(1))   # 初始值 1.0
+        self.alpha_left  = nn.Parameter(torch.ones(1))
+        self.alpha_right = nn.Parameter(torch.ones(1))
+        self._cached_attn_left  = None
+        self._cached_attn_right = None
+
+    def freeze_alpha(self):
+        self.alpha_left.requires_grad  = False
+        self.alpha_right.requires_grad = False
+
+    def unfreeze_alpha(self):
+        self.alpha_left.requires_grad  = True
+        self.alpha_right.requires_grad = True
+
+    def get_attn_weights(self):
+        """返回最近一次 forward 第一层的 cross-attn 权重，shape: (B, K, K)"""
+        return self._cached_attn_left, self._cached_attn_right
 
     def forward(self, left_hidden, right_hidden, action_token_start_idx):
         left_action  = left_hidden[:, action_token_start_idx:, :]
@@ -615,8 +665,13 @@ class CrossArmCoordinationModule(nn.Module):
 
         left_orig  = left_action
         right_orig = right_action
-        for layer in self.layers:
-            left_action, right_action = layer(left_action, right_action, causal_mask)
+        for i, layer in enumerate(self.layers):
+            if i == 0:
+                left_action, right_action, lw, rw = layer(left_action, right_action, causal_mask, return_weights=True)
+                self._cached_attn_left  = lw.detach()
+                self._cached_attn_right = rw.detach()
+            else:
+                left_action, right_action = layer(left_action, right_action, causal_mask)
 
         # 最终残差融合
         left_new_action  = left_orig  + self.alpha_left  * left_action
@@ -868,11 +923,12 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
             _, logits_right = self._llm_final_forward(self.llm_right, h_right, mask_right, None, start_layer=N + 1)
 
             # 只允许从合法 action token 里选，屏蔽文字 token 和 padding token
-            action_token_begin = self.vocab_size - (self.bin_centers.shape[0] + 1)
+            true_vocab_size = self.config.text_config.vocab_size  # 32000
+            action_token_begin = true_vocab_size - (self.bin_centers.shape[0] + 1)
             logits_left[:,  -1, :action_token_begin] = float('-inf')
             logits_right[:, -1, :action_token_begin] = float('-inf')
-            logits_left[:,  -1, self.vocab_size:] = float('-inf')
-            logits_right[:, -1, self.vocab_size:] = float('-inf')
+            logits_left[:,  -1, true_vocab_size:] = float('-inf')
+            logits_right[:, -1, true_vocab_size:] = float('-inf')
             next_left  = logits_left[:,  -1, :].argmax(dim=-1, keepdim=True)
             next_right = logits_right[:, -1, :].argmax(dim=-1, keepdim=True)
             generated_left.append(next_left[0].item())
@@ -890,8 +946,9 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
 
     def _decode_action(self, token_ids, unnorm_key, arm):
         predicted   = np.array(token_ids)
+        true_vocab_size = self.config.text_config.vocab_size  # 32000
         discretized = np.clip(
-            self.vocab_size - predicted - 1,
+            true_vocab_size - predicted - 1,
             a_min=0, a_max=self.bin_centers.shape[0] - 1
         )
         normalized  = self.bin_centers[discretized]

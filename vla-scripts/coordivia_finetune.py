@@ -45,6 +45,9 @@ from transformers import AutoConfig, AutoImageProcessor
 from torchvision import transforms as T
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import wandb
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
@@ -329,7 +332,7 @@ class FinetuneConfig:
     # Fine-tuning Parameters
     batch_size: int = 16                                            # Fine-tuning batch size
     max_steps: int = 200_000                                        # Max number of fine-tuning steps
-    save_steps: int = 5000                                          # Interval for checkpoint saving
+    save_steps: int = 500                                           # Interval for checkpoint saving
     learning_rate: float = 1e-4                                     # Fine-tuning learning rate
     warmup_steps: int = 500                                         # Warmup 步数，从 0 线性升到 learning_rate
     max_grad_norm: float = 1.0                                      # Gradient clipping，防止梯度爆炸
@@ -447,10 +450,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         for n, p in vla.named_parameters():
             if 'coordination_module' in n:
                 p.requires_grad = True
+        coord_mod_base = vla.module.get_base_model().coordination_module
 
-        # Create Optimizer，三个 param group：主干 LoRA / coord 模块 / alpha
-        alpha_params = [p for n, p in vla.named_parameters()
-                        if ('alpha_left' in n or 'alpha_right' in n) and p.requires_grad]
+        # Create Optimizer，三个 param group（alpha 前1000步 lr=0，避免 DDP unused parameter 问题）
+        alpha_params = [coord_mod_base.alpha_left, coord_mod_base.alpha_right]
         coord_params = [p for n, p in vla.named_parameters()
                         if 'coordination_module' in n
                         and 'alpha_left' not in n and 'alpha_right' not in n
@@ -461,8 +464,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                         and p.requires_grad]
         optimizer = AdamW([
             {'params': lora_params,  'lr': cfg.learning_rate},
-            {'params': coord_params, 'lr': 1e-4},
-            {'params': alpha_params, 'lr': cfg.learning_rate},
+            {'params': coord_params, 'lr': cfg.learning_rate / 2},
+            {'params': alpha_params, 'lr': 0.0},  # 前1000步不更新
         ])
     else:
         lora_params = [p for p in vla.parameters() if p.requires_grad]
@@ -515,8 +518,10 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
+    recent_action_losses = deque(maxlen=cfg.grad_accumulation_steps)
     recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
+    recent_alpha_reg_losses = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Train!
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -541,8 +546,15 @@ def finetune(cfg: FinetuneConfig) -> None:
                     )
                     loss = output.loss
 
+                # Alpha 惩罚项：1000步后才加，冻结期间不干扰其他参数
+                alpha_reg_loss = torch.tensor(0.0, device=device_id)
+                if use_coordination and gradient_step_idx >= 1000:
+                    coord_mod = vla.module.get_base_model().coordination_module
+                    alpha_reg_loss = -0.1 * (coord_mod.alpha_left.clamp(min=0) + coord_mod.alpha_right.clamp(min=0))
+                total_loss = loss + alpha_reg_loss
+
                 # Normalize loss to account for gradient accumulation
-                normalized_loss = loss / cfg.grad_accumulation_steps
+                normalized_loss = total_loss / cfg.grad_accumulation_steps
 
                 # Backward pass
                 normalized_loss.backward()
@@ -578,13 +590,17 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                 # Store recent train metrics
                 recent_losses.append(loss.item())
+                recent_action_losses.append(output.loss.item())
                 recent_action_accuracies.append(action_accuracy.item())
                 recent_l1_losses.append(action_l1_loss.item())
+                recent_alpha_reg_losses.append(alpha_reg_loss.item())
 
                 # Compute smoothened train metrics
                 smoothened_loss = sum(recent_losses) / len(recent_losses)
+                smoothened_action_loss = sum(recent_action_losses) / len(recent_action_losses)
                 smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
                 smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
+                smoothened_alpha_reg_loss = sum(recent_alpha_reg_losses) / len(recent_alpha_reg_losses)
 
                 # Optimizer Step
                 if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
@@ -593,6 +609,16 @@ def finetune(cfg: FinetuneConfig) -> None:
                     scheduler.step()
                     optimizer.zero_grad()
                     gradient_step_idx += 1
+
+                    # 1000步后激活 alpha lr（scheduler 会覆盖，每步强制设回）
+                    if use_coordination and gradient_step_idx >= 1000:
+                        optimizer.param_groups[2]['lr'] = cfg.learning_rate
+                    if use_coordination and gradient_step_idx == 1000:
+                        print("Step 1000: alpha lr activated")
+                    if use_coordination and gradient_step_idx == 1001:
+                        print(f"alpha_left grad: {coord_mod_base.alpha_left.grad}")
+                        print(f"alpha_right grad: {coord_mod_base.alpha_right.grad}")
+                        print(f"alpha_left value: {coord_mod_base.alpha_left.item()}")
                     progress.update()
 
                     # Push Metrics to W&B (every 10 gradient steps)
@@ -603,9 +629,26 @@ def finetune(cfg: FinetuneConfig) -> None:
                             "l1_loss": smoothened_l1_loss,
                         }
                         if use_coordination:
+                            log_dict["alpha_reg_loss"] = smoothened_alpha_reg_loss
                             coord_mod = vla.module.get_base_model().coordination_module
                             log_dict["alpha_left"]  = coord_mod.alpha_left.item()
                             log_dict["alpha_right"] = coord_mod.alpha_right.item()
+
+                            # 每 200 步记录一次 cross-attn 热力图
+                            if gradient_step_idx % 200 == 0:
+                                lw, rw = coord_mod.get_attn_weights()
+                                if lw is not None:
+                                    for name, w in [("left_queries_right", lw), ("right_queries_left", rw)]:
+                                        arr = w[0].float().cpu().numpy()
+                                        fig, ax = plt.subplots(figsize=(4, 4))
+                                        im = ax.imshow(arr, aspect="auto", cmap="viridis", interpolation="nearest", extent=[0,1,1,0], vmin=0, vmax=1)
+                                        ax.set_xlabel("Key (source arm)")
+                                        ax.set_ylabel("Query (target arm)")
+                                        ax.set_title(f"cross_attn/{name} step={gradient_step_idx}")
+                                        plt.colorbar(im, ax=ax)
+                                        plt.tight_layout()
+                                        log_dict[f"cross_attn/{name}"] = wandb.Image(fig)
+                                        plt.close(fig)
                         wandb.log(log_dict, step=gradient_step_idx)
 
                     # Save Model Checkpoint
@@ -615,6 +658,10 @@ def finetune(cfg: FinetuneConfig) -> None:
                             save_dir = adapter_dir if cfg.use_lora else run_dir
                             processor.save_pretrained(run_dir)
                             vla.module.save_pretrained(save_dir)
+                            if use_coordination:
+                                coord_state = vla.module.get_base_model().coordination_module.state_dict()
+                                torch.save(coord_state, f"{save_dir}/coordination_module.pt")
+                                print(f"Saved coordination_module weights to {save_dir}/coordination_module.pt")
 
                         dist.barrier()
 
@@ -638,6 +685,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         save_dir = adapter_dir if cfg.use_lora else run_dir
         processor.save_pretrained(run_dir)
         vla.module.save_pretrained(save_dir)
+        if use_coordination:
+            coord_state = vla.module.get_base_model().coordination_module.state_dict()
+            torch.save(coord_state, f"{save_dir}/coordination_module.pt")
+            print(f"Saved coordination_module weights to {save_dir}/coordination_module.pt")
     dist.barrier()
 
 

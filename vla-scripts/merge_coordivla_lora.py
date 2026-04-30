@@ -60,6 +60,15 @@ def main():
     merged_vla = PeftModel.from_pretrained(base_vla, args.adapter_dir)
     merged_vla = merged_vla.merge_and_unload()
 
+    # 加载 coordination_module 权重（全参数训练，不在 LoRA adapter 里）
+    coord_ckpt = Path(args.adapter_dir) / "coordination_module.pt"
+    if coord_ckpt.exists():
+        print(f"加载 coordination_module 权重: {coord_ckpt}")
+        coord_state = torch.load(coord_ckpt, map_location="cpu")
+        merged_vla.coordination_module.load_state_dict(coord_state)
+    elif args.use_coordination.lower() == "true":
+        print("警告：use_coordination=True 但未找到 coordination_module.pt，协调模块将使用随机初始化权重")
+
     print(f"保存完整权重到: {args.save_dir}")
     # 注入真实 norm_stats（推理时反归一化用）
     if args.stats_path is not None:
