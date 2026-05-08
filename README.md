@@ -10,7 +10,7 @@ This repository is mainly a research prototype. It focuses on the engineering pa
 - CoordiVLA cross-arm coordination module inserted into intermediate LLM hidden states.
 - Meta-query summary design: 16 learned queries compress opposite-arm visual context into summary tokens.
 - Main `summary16 7x23` setting: 16 opposite-arm visual summary tokens plus 7 visible opposite-arm action-prefix tokens.
-- Cross-arm information is used inside the coordination module only; it is not kept as an explicit prefix through later LLM layers.
+- Optional coordination prefix memory carries opposite-arm summary tokens through the remaining LLM layers after the coordination module.
 - Support for `7x23` and `7x30` attention map analysis.
 - Joint-delta action representation with absolute gripper state.
 - RoboTwin training, merge, inference, and action debug workflow.
@@ -21,7 +21,7 @@ The baseline keeps the OpenVLA visual-language-action pipeline but expands the a
 
 CoordiVLA adds a coordination layer between the two branches. In the main `summary16 7x23` version, each arm first summarizes the opposite-arm visual context with learned meta queries. The resulting 16 summary tokens are concatenated with the opposite arm's 7 visible action-prefix tokens. The current arm reads this 23-token coordination memory inside the coordination module when updating its action hidden states. A causal visibility mask prevents access to future action tokens during training.
 
-This implementation does not use the explicit-prefix variant where cross-arm summary tokens are appended to later LLM layers. Cross-arm information acts only at the inserted coordination module and is then written back into the current action hidden states.
+The implementation also supports coordination prefix memory. When `coordination_prefix_memory=True`, the opposite-arm summary tokens are prepended to the hidden sequence after the coordination module and are processed by the remaining LLM layers. This lets cross-arm information continue to affect later LLM computation. These added prefix tokens are sliced out before computing the final action logits.
 
 For action representation, the joint dimensions use frame-to-frame joint increments, while the gripper dimension keeps an absolute state. For tasks with continuous gripper motion such as `lift_pot`, the gripper can be kept as continuous absolute openness.
 
