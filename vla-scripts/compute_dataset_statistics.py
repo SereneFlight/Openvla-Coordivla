@@ -17,6 +17,12 @@ import json
 import numpy as np
 import h5py
 
+from prismatic.vla.robotwin_action_utils import build_joint_delta_gripper_cont_abs
+
+
+ACTION_ENCODING = "joint_delta_gripper_cont_abs"
+ACTION_MASK = [True, True, True, True, True, True, False]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -38,8 +44,9 @@ def main():
             right_arm    = f["joint_action/right_arm"][:]     # (T, 6)
             right_gripper = f["joint_action/right_gripper"][:] # (T,)
 
-            left  = np.concatenate([left_arm,  left_gripper[:, None]],  axis=1)  # (T, 7)
-            right = np.concatenate([right_arm, right_gripper[:, None]], axis=1)  # (T, 7)
+            # Match training labels: arm joint deltas plus continuous absolute gripper opening.
+            left = build_joint_delta_gripper_cont_abs(left_arm, left_gripper)    # (T - 1, 7)
+            right = build_joint_delta_gripper_cont_abs(right_arm, right_gripper) # (T - 1, 7)
 
             left_actions.append(left)
             right_actions.append(right)
@@ -51,7 +58,7 @@ def main():
     lq99 = np.percentile(left_all,  99, axis=0).tolist()
     rq01 = np.percentile(right_all, 1,  axis=0).tolist()
     rq99 = np.percentile(right_all, 99, axis=0).tolist()
-    mask = [True] * 7
+    mask = ACTION_MASK
 
     print(f"lq01: {[f'{v:.4f}' for v in lq01]}")
     print(f"lq99: {[f'{v:.4f}' for v in lq99]}")
@@ -66,6 +73,7 @@ def main():
                 "rq01": rq01,
                 "rq99": rq99,
                 "mask": mask,
+                "action_encoding": ACTION_ENCODING,
             }
         }
     }

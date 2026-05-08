@@ -11,6 +11,7 @@ References [LLaVa, IDEFICS-2]:
 """
 
 import logging
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -590,32 +591,46 @@ class CoordinationLayer(nn.Module):
         self.ffn_right = nn.Sequential(
             nn.Linear(hidden_size, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_size))
 
-    def forward(self, left_action, right_action, causal_mask, return_weights=False):
+    def forward(
+        self,
+        left_action,
+        right_action,
+        left_context,
+        right_context,
+        action_token_start_idx,
+        self_causal_mask,
+        left_cross_mask,
+        right_cross_mask,
+        return_weights=False,
+    ):
         # self-attn (Pre-LN + 残差)
         left_self,  _ = self.self_attn_left(
             self.norm_self_left(left_action),
             self.norm_self_left(left_action),
             self.norm_self_left(left_action),
-            attn_mask=causal_mask, need_weights=False)
+            attn_mask=self_causal_mask, need_weights=False)
         right_self, _ = self.self_attn_right(
             self.norm_self_right(right_action),
             self.norm_self_right(right_action),
             self.norm_self_right(right_action),
-            attn_mask=causal_mask, need_weights=False)
+            attn_mask=self_causal_mask, need_weights=False)
         left_action  = left_action  + left_self
         right_action = right_action + right_self
 
-        # cross-attn (Pre-LN + 残差)
+        # cross-attn (Pre-LN + residual): action queries read compressed
+        # context summaries plus the other arm's causally visible action states.
+        left_context_for_cross = torch.cat([left_context, left_action], dim=1)
+        right_context_for_cross = torch.cat([right_context, right_action], dim=1)
         left_out,  left_attn_w  = self.cross_attn_left(
             self.norm_cross_left(left_action),
-            self.norm_cross_right(right_action),
-            self.norm_cross_right(right_action),
-            need_weights=return_weights)
+            self.norm_cross_right(right_context_for_cross),
+            self.norm_cross_right(right_context_for_cross),
+            attn_mask=left_cross_mask, need_weights=return_weights)
         right_out, right_attn_w = self.cross_attn_right(
             self.norm_cross_right(right_action),
-            self.norm_cross_left(left_action),
-            self.norm_cross_left(left_action),
-            need_weights=return_weights)
+            self.norm_cross_left(left_context_for_cross),
+            self.norm_cross_left(left_context_for_cross),
+            attn_mask=right_cross_mask, need_weights=return_weights)
         left_action  = left_action  + left_out
         right_action = right_action + right_out
 
@@ -628,17 +643,126 @@ class CoordinationLayer(nn.Module):
         return left_action, right_action
 
 
-# CrossArmCoordinationModule:多层跨臂协调模块
-class CrossArmCoordinationModule(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, num_layers: int = 3) -> None:
+# Meta-query coordination layer: action queries read cross-arm prefix memory.
+class MetaQueryCoordinationLayer(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        ffn_dim: int = None,
+        include_self_action_prefix: bool = True,
+    ) -> None:
         super().__init__()
-        self.layers = nn.ModuleList(
-            [CoordinationLayer(hidden_size, num_heads) for _ in range(num_layers)]
+        ffn_dim = ffn_dim or 1024
+        self.include_self_action_prefix = include_self_action_prefix
+        self.prefix_attn_left = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.prefix_attn_right = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+
+        self.norm_query_left = nn.LayerNorm(hidden_size)
+        self.norm_query_right = nn.LayerNorm(hidden_size)
+        self.norm_memory_left = nn.LayerNorm(hidden_size)
+        self.norm_memory_right = nn.LayerNorm(hidden_size)
+        self.norm_ffn_left = nn.LayerNorm(hidden_size)
+        self.norm_ffn_right = nn.LayerNorm(hidden_size)
+
+        self.ffn_left = nn.Sequential(
+            nn.Linear(hidden_size, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_size)
         )
+        self.ffn_right = nn.Sequential(
+            nn.Linear(hidden_size, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, hidden_size)
+        )
+
+    @property
+    def num_heads(self) -> int:
+        return self.prefix_attn_left.num_heads
+
+    def forward(
+        self,
+        left_action,
+        right_action,
+        left_context,
+        right_context,
+        left_prefix_mask,
+        right_prefix_mask,
+        return_weights=False,
+    ):
+        if self.include_self_action_prefix:
+            left_memory = torch.cat([right_context, right_action, left_action], dim=1)
+            right_memory = torch.cat([left_context, left_action, right_action], dim=1)
+        else:
+            left_memory = torch.cat([right_context, right_action], dim=1)
+            right_memory = torch.cat([left_context, left_action], dim=1)
+
+        left_out, left_attn_w = self.prefix_attn_left(
+            self.norm_query_left(left_action),
+            self.norm_memory_right(left_memory),
+            self.norm_memory_right(left_memory),
+            attn_mask=left_prefix_mask,
+            need_weights=return_weights,
+        )
+        right_out, right_attn_w = self.prefix_attn_right(
+            self.norm_query_right(right_action),
+            self.norm_memory_left(right_memory),
+            self.norm_memory_left(right_memory),
+            attn_mask=right_prefix_mask,
+            need_weights=return_weights,
+        )
+
+        left_action = left_action + left_out
+        right_action = right_action + right_out
+        left_action = left_action + self.ffn_left(self.norm_ffn_left(left_action))
+        right_action = right_action + self.ffn_right(self.norm_ffn_right(right_action))
+
+        if return_weights:
+            return left_action, right_action, left_attn_w, right_attn_w
+        return left_action, right_action
+
+
+# CrossArmCoordinationModule: multi-layer cross-arm coordination module.
+class CrossArmCoordinationModule(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_layers: int = 3,
+        summary_tokens: int = 0,
+        fusion: str = "residual",
+        include_self_action_prefix: bool = True,
+    ) -> None:
+        super().__init__()
+        self.summary_tokens = summary_tokens
+        if fusion not in {"residual", "meta_query"}:
+            raise ValueError(f"fusion must be 'residual' or 'meta_query', got {fusion!r}")
+        self.fusion = fusion
+        if summary_tokens > 0:
+            self.left_summary_queries = nn.Parameter(torch.empty(summary_tokens, hidden_size))
+            self.right_summary_queries = nn.Parameter(torch.empty(summary_tokens, hidden_size))
+            nn.init.normal_(self.left_summary_queries, mean=0.0, std=0.02)
+            nn.init.normal_(self.right_summary_queries, mean=0.0, std=0.02)
+            self.norm_summary_query_left = nn.LayerNorm(hidden_size)
+            self.norm_summary_query_right = nn.LayerNorm(hidden_size)
+            self.norm_summary_context_left = nn.LayerNorm(hidden_size)
+            self.norm_summary_context_right = nn.LayerNorm(hidden_size)
+        if fusion == "meta_query":
+            self.include_self_action_prefix = include_self_action_prefix
+            self.layers = nn.ModuleList(
+                [
+                    MetaQueryCoordinationLayer(
+                        hidden_size,
+                        num_heads,
+                        include_self_action_prefix=include_self_action_prefix,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+        else:
+            self.include_self_action_prefix = True
+            self.layers = nn.ModuleList([CoordinationLayer(hidden_size, num_heads) for _ in range(num_layers)])
         self.alpha_left  = nn.Parameter(torch.ones(1))
         self.alpha_right = nn.Parameter(torch.ones(1))
         self._cached_attn_left  = None
         self._cached_attn_right = None
+        self._cached_coord_stats = {}
 
     def freeze_alpha(self):
         self.alpha_left.requires_grad  = False
@@ -649,38 +773,171 @@ class CrossArmCoordinationModule(nn.Module):
         self.alpha_right.requires_grad = True
 
     def get_attn_weights(self):
-        """返回最近一次 forward 第一层的 cross-attn 权重，shape: (B, K, K)"""
+        """Return the first layer's coordination attention weights, shape: (B, action_len, source_len)."""
         return self._cached_attn_left, self._cached_attn_right
 
-    def forward(self, left_hidden, right_hidden, action_token_start_idx):
-        left_action  = left_hidden[:, action_token_start_idx:, :]
-        right_action = right_hidden[:, action_token_start_idx:, :]
+    def get_coord_stats(self):
+        return self._cached_coord_stats
+
+    def _query_summary_attention(self, queries, context):
+        batch_size, query_len, hidden_size = queries.shape
+        context_len = context.shape[1]
+        num_heads = self.layers[0].num_heads if hasattr(self.layers[0], "num_heads") else self.layers[0].self_attn_left.num_heads
+        head_dim = hidden_size // num_heads
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"hidden_size={hidden_size} must be divisible by num_heads={num_heads}")
+
+        q = queries.reshape(batch_size, query_len, num_heads, head_dim).transpose(1, 2)
+        k = context.reshape(batch_size, context_len, num_heads, head_dim).transpose(1, 2)
+        v = context.reshape(batch_size, context_len, num_heads, head_dim).transpose(1, 2)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        attn = torch.softmax(scores.float(), dim=-1).to(v.dtype)
+        out = torch.matmul(attn, v)
+        return out.transpose(1, 2).reshape(batch_size, query_len, hidden_size)
+
+    def _summarize_context(self, left_context, right_context):
+        if self.summary_tokens <= 0:
+            return left_context, right_context
+        batch_size = left_context.shape[0]
+        left_queries = self.left_summary_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        right_queries = self.right_summary_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        left_summary = self._query_summary_attention(
+            self.norm_summary_query_left(left_queries),
+            self.norm_summary_context_left(left_context),
+        )
+        right_summary = self._query_summary_attention(
+            self.norm_summary_query_right(right_queries),
+            self.norm_summary_context_right(right_context),
+        )
+        left_summary = left_queries + left_summary
+        right_summary = right_queries + right_summary
+        return left_summary, right_summary
+
+    def forward(self, left_hidden, right_hidden, action_token_start_idx, action_token_end_idx=None, visual_context_end_idx=None):
+        if action_token_end_idx is None:
+            action_token_end_idx = left_hidden.shape[1]
+        if visual_context_end_idx is None:
+            visual_context_end_idx = action_token_start_idx
+        visual_context_end_idx = min(visual_context_end_idx, action_token_start_idx)
+
+        left_action  = left_hidden[:, action_token_start_idx:action_token_end_idx, :]
+        right_action = right_hidden[:, action_token_start_idx:action_token_end_idx, :]
+        left_context = left_hidden[:, :visual_context_end_idx, :]
+        right_context = right_hidden[:, :visual_context_end_idx, :]
         K = left_action.shape[1]
 
         if K == 0:
+            self._cached_attn_left = None
+            self._cached_attn_right = None
+            self._cached_coord_stats = {}
             return left_hidden, right_hidden
 
-        causal_mask = torch.triu(
+        self_causal_mask = torch.triu(
             torch.ones(K, K, dtype=torch.bool, device=left_hidden.device), diagonal=1)
+        query_pos = torch.arange(action_token_start_idx, action_token_end_idx, device=left_hidden.device).unsqueeze(1)
+        left_context, right_context = self._summarize_context(left_context, right_context)
+        if self.summary_tokens > 0:
+            context_key_pos = torch.full(
+                (left_context.shape[1],), -1, dtype=torch.long, device=left_hidden.device
+            )
+        else:
+            context_key_pos = torch.arange(visual_context_end_idx, device=left_hidden.device)
+        action_key_pos = torch.arange(action_token_start_idx, action_token_end_idx, device=left_hidden.device)
+        if self.fusion == "meta_query":
+            key_pos_parts = [context_key_pos, action_key_pos]
+            if self.include_self_action_prefix:
+                key_pos_parts.append(action_key_pos)
+            key_pos = torch.cat(key_pos_parts).unsqueeze(0)
+        else:
+            key_pos = torch.cat([context_key_pos, action_key_pos]).unsqueeze(0)
+        cross_mask = key_pos > query_pos
 
         left_orig  = left_action
         right_orig = right_action
         for i, layer in enumerate(self.layers):
             if i == 0:
-                left_action, right_action, lw, rw = layer(left_action, right_action, causal_mask, return_weights=True)
+                if self.fusion == "meta_query":
+                    left_action, right_action, lw, rw = layer(
+                        left_action,
+                        right_action,
+                        left_context,
+                        right_context,
+                        cross_mask,
+                        cross_mask,
+                        return_weights=True,
+                    )
+                else:
+                    left_action, right_action, lw, rw = layer(
+                        left_action,
+                        right_action,
+                        left_context,
+                        right_context,
+                        action_token_start_idx,
+                        self_causal_mask,
+                        cross_mask,
+                        cross_mask,
+                        return_weights=True,
+                    )
                 self._cached_attn_left  = lw.detach()
                 self._cached_attn_right = rw.detach()
             else:
-                left_action, right_action = layer(left_action, right_action, causal_mask)
+                if self.fusion == "meta_query":
+                    left_action, right_action = layer(
+                        left_action,
+                        right_action,
+                        left_context,
+                        right_context,
+                        cross_mask,
+                        cross_mask,
+                    )
+                else:
+                    left_action, right_action = layer(
+                        left_action,
+                        right_action,
+                        left_context,
+                        right_context,
+                        action_token_start_idx,
+                        self_causal_mask,
+                        cross_mask,
+                        cross_mask,
+                    )
 
-        # 最终残差融合
-        left_new_action  = left_orig  + self.alpha_left  * left_action
-        right_new_action = right_orig + self.alpha_right * right_action
+        # Residual fusion is kept for the legacy module. The meta-query module
+        # already fuses information inside prefix attention, so no external alpha
+        # scaling is applied.
+        left_delta = left_action - left_orig
+        right_delta = right_action - right_orig
+        if self.fusion == "meta_query":
+            left_new_action = left_action
+            right_new_action = right_action
+        else:
+            left_new_action  = left_orig  + self.alpha_left  * left_delta
+            right_new_action = right_orig + self.alpha_right * right_delta
+
+        with torch.no_grad():
+            left_delta_norm = left_delta.detach().float().norm(dim=-1).mean()
+            right_delta_norm = right_delta.detach().float().norm(dim=-1).mean()
+            left_hidden_norm = left_orig.detach().float().norm(dim=-1).mean()
+            right_hidden_norm = right_orig.detach().float().norm(dim=-1).mean()
+            if self.fusion == "meta_query":
+                left_effective_norm = left_delta.detach().float().norm(dim=-1).mean()
+                right_effective_norm = right_delta.detach().float().norm(dim=-1).mean()
+            else:
+                left_effective_norm = (self.alpha_left.detach().float().abs() * left_delta.detach().float()).norm(dim=-1).mean()
+                right_effective_norm = (self.alpha_right.detach().float().abs() * right_delta.detach().float()).norm(dim=-1).mean()
+            self._cached_coord_stats = {
+                "coord_delta_norm_left": left_delta_norm.detach(),
+                "coord_delta_norm_right": right_delta_norm.detach(),
+                "coord_hidden_norm_left": left_hidden_norm.detach(),
+                "coord_hidden_norm_right": right_hidden_norm.detach(),
+                "coord_effective_ratio_left": (left_effective_norm / left_hidden_norm.clamp(min=1e-6)).detach(),
+                "coord_effective_ratio_right": (right_effective_norm / right_hidden_norm.clamp(min=1e-6)).detach(),
+            }
 
         left_out  = left_hidden.clone()
         right_out = right_hidden.clone()
-        left_out[:,  action_token_start_idx:, :] = left_new_action
-        right_out[:, action_token_start_idx:, :] = right_new_action
+        left_out[:,  action_token_start_idx:action_token_end_idx, :] = left_new_action
+        right_out[:, action_token_start_idx:action_token_end_idx, :] = right_new_action
         return left_out, right_out
 
 # CoordiVLAForActionPrediction:主模型
@@ -715,10 +972,16 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
             config.use_fused_vision_backbone, vision_dim=self.vision_backbone.embed_dim,llm_dim=config.text_config.hidden_size,
         )
         self.use_coordination = config.use_coordination
+        self.coordination_prefix_memory = bool(getattr(config, "coordination_prefix_memory", False))
+        self.visual_context_end_idx = None
         if self.use_coordination:
             self.coordination_module = CrossArmCoordinationModule(
                 hidden_size=config.text_config.hidden_size,
                 num_heads=config.coordination_num_heads,
+                num_layers=config.coordination_num_layers,
+                summary_tokens=config.coordination_summary_tokens,
+                fusion=config.coordination_fusion,
+                include_self_action_prefix=getattr(config, "coordination_include_self_action_prefix", True),
             )
 
         # 独立 LLM（各自的 7B 参数）
@@ -765,7 +1028,7 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         multimodal_mask = torch.cat(
             [attention_mask[:, :1], patch_mask, attention_mask[:, 1:]], dim=1
         )
-        return multimodal_embeds, multimodal_mask
+        return multimodal_embeds, multimodal_mask, 1 + projected.shape[1]
 
     def _build_multimodal_labels(self, labels, n_patch):
         patch_ignore = torch.full(
@@ -775,30 +1038,73 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         return torch.cat([labels[:, :1], patch_ignore, labels[:, 1:]], dim=1)
 
     @staticmethod
-    def _get_action_token_start_idx(mm_labels):
-        # 返回每个样本各自的 action 起点，List[int]，长度=B
-        starts = []
+    def _get_action_prediction_spans(mm_labels):
+        # Coordinate the hidden states that predict action tokens.
+        # In causal LM training, label at position j is predicted by logits at j - 1.
+        spans = []
         for i in range(mm_labels.shape[0]):
             non_ignore = (mm_labels[i] != IGNORE_INDEX).nonzero(as_tuple=True)[0]
             if len(non_ignore) == 0:
                 raise ValueError(f"sample {i}: labels 中没有找到非 IGNORE_INDEX 的 token")
-            starts.append(non_ignore[0].item())
-        return starts
+            start = non_ignore[0].item() - 1
+            end = non_ignore[-1].item()
+            if start < 0 or end <= start:
+                raise ValueError(
+                    f"sample {i}: invalid action prediction span start={start}, end={end}"
+                )
+            spans.append((start, end))
+        return spans
 
-    def _apply_coordination_per_sample(self, hidden_left, hidden_right, action_starts):
+    def _apply_coordination_per_sample(self, hidden_left, hidden_right, action_spans):
         # 对 batch 内每个样本单独做 coordination，避免不同样本 action_start 不一致
         outs_left, outs_right = [], []
-        for b, s in enumerate(action_starts):
+        coord_stats = []
+        cached_attn_left = None
+        cached_attn_right = None
+        for b, (s, e) in enumerate(action_spans):
             hl, hr = self.coordination_module(
-                hidden_left[b:b+1], hidden_right[b:b+1], s
+                hidden_left[b:b+1], hidden_right[b:b+1], s, e, self.visual_context_end_idx
             )
             outs_left.append(hl)
             outs_right.append(hr)
+            stats = self.coordination_module.get_coord_stats()
+            if stats:
+                coord_stats.append({k: v.detach().float() for k, v in stats.items()})
+            if cached_attn_left is None:
+                cached_attn_left, cached_attn_right = self.coordination_module.get_attn_weights()
+
+        if coord_stats:
+            self.coordination_module._cached_coord_stats = {
+                k: torch.stack([stats[k] for stats in coord_stats]).mean()
+                for k in coord_stats[0]
+            }
+        self.coordination_module._cached_attn_left = cached_attn_left
+        self.coordination_module._cached_attn_right = cached_attn_right
         return torch.cat(outs_left, dim=0), torch.cat(outs_right, dim=0)
+
+    def _build_cross_arm_prefix_memory(self, hidden_left, hidden_right):
+        if (
+            not self.use_coordination
+            or not self.coordination_prefix_memory
+            or self.visual_context_end_idx is None
+        ):
+            return None, None
+        if not hasattr(self, "coordination_module"):
+            return None, None
+        if getattr(self.coordination_module, "summary_tokens", 0) <= 0:
+            raise ValueError("coordination_prefix_memory requires coordination_summary_tokens > 0")
+
+        visual_end = min(self.visual_context_end_idx, hidden_left.shape[1], hidden_right.shape[1])
+        left_context = hidden_left[:, :visual_end, :]
+        right_context = hidden_right[:, :visual_end, :]
+        left_summary, right_summary = self.coordination_module._summarize_context(left_context, right_context)
+        # Prefixes are cross-arm memories: left branch carries right summary and vice versa.
+        return right_summary, left_summary
 
     def _llm_partial_forward(self, llm, inputs_embeds, attention_mask, stop_layer):
         model = llm.model
         B, seq_len, _ = inputs_embeds.shape
+        attention_mask = attention_mask.to(inputs_embeds.device)
         causal_mask  = _prepare_4d_causal_attention_mask(
             attention_mask, (B, seq_len), inputs_embeds, past_key_values_length=0
         )
@@ -810,18 +1116,43 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
             )[0]
         return hidden_states
 
-    def _llm_final_forward(self, llm, hidden_states, attention_mask, labels, start_layer):
+    def _llm_final_forward(self, llm, hidden_states, attention_mask, labels, start_layer, prefix_memory=None):
         model = llm.model
         B, seq_len, _ = hidden_states.shape
+        attention_mask = attention_mask.to(hidden_states.device)
+        prefix_len = 0
+        if prefix_memory is not None:
+            if prefix_memory.shape[0] != B:
+                raise ValueError(
+                    f"prefix memory batch {prefix_memory.shape[0]} does not match hidden batch {B}"
+                )
+            prefix_len = prefix_memory.shape[1]
+            prefix_memory = prefix_memory.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            hidden_states = torch.cat([prefix_memory, hidden_states], dim=1)
+            prefix_mask = torch.ones(
+                B,
+                prefix_len,
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+        total_len = hidden_states.shape[1]
         causal_mask  = _prepare_4d_causal_attention_mask(
-            attention_mask, (B, seq_len), hidden_states, past_key_values_length=0
+            attention_mask, (B, total_len), hidden_states, past_key_values_length=0
         )
-        position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(B, -1)
+        if prefix_len:
+            prefix_position_ids = torch.arange(prefix_len, device=hidden_states.device)
+            token_position_ids = torch.arange(seq_len, device=hidden_states.device)
+            position_ids = torch.cat([prefix_position_ids, token_position_ids]).unsqueeze(0).expand(B, -1)
+        else:
+            position_ids = torch.arange(total_len, device=hidden_states.device).unsqueeze(0).expand(B, -1)
         for idx in range(start_layer, len(model.layers)):
             hidden_states = model.layers[idx](
                 hidden_states, attention_mask=causal_mask, position_ids=position_ids
             )[0]
         hidden_states = model.norm(hidden_states)
+        if prefix_len:
+            hidden_states = hidden_states[:, prefix_len:, :]
         logits = llm.lm_head(hidden_states)
         loss = None
         if labels is not None:
@@ -848,38 +1179,50 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         assert pixel_values_wrist_left is not None and pixel_values_wrist_right is not None
         assert pixel_values_global is not None 
 
-        embeds_left,  mask_left  = self._build_multimodal_embeds(
+        embeds_left, mask_left, visual_context_end_idx_left = self._build_multimodal_embeds(
             self.llm_left,  self.projector_left, pixel_values_global, pixel_values_wrist_left, input_ids_left,  attention_mask_left
         )
-        embeds_right, mask_right = self._build_multimodal_embeds(
+        embeds_right, mask_right, visual_context_end_idx_right = self._build_multimodal_embeds(
             self.llm_right, self.projector_right, pixel_values_global, pixel_values_wrist_right, input_ids_right, attention_mask_right
         )
+        if visual_context_end_idx_left != visual_context_end_idx_right:
+            raise ValueError(
+                f"left/right visual context lengths differ: left={visual_context_end_idx_left}, right={visual_context_end_idx_right}"
+            )
+        self.visual_context_end_idx = visual_context_end_idx_left
 
         n_patch = embeds_left.shape[1] - input_ids_left.shape[1]
         mm_labels_left  = self._build_multimodal_labels(labels_left,  n_patch) if labels_left  is not None else None
         mm_labels_right = self._build_multimodal_labels(labels_right, n_patch) if labels_right is not None else None
 
-        if mm_labels_left is not None:
-            action_starts = self._get_action_token_start_idx(mm_labels_left)  # List[int], len=B
+        if mm_labels_left is not None and mm_labels_right is not None:
+            action_spans = self._get_action_prediction_spans(mm_labels_left)  # List[(start, end)], len=B
+            action_spans_right = self._get_action_prediction_spans(mm_labels_right)
+            if action_spans != action_spans_right:
+                raise ValueError(
+                    f"left/right action prediction spans differ: left={action_spans}, right={action_spans_right}"
+                )
         else:
-            action_starts = [embeds_left.shape[1]] * embeds_left.shape[0]
+            action_spans = [(embeds_left.shape[1], embeds_left.shape[1])] * embeds_left.shape[0]
 
         N = self.coordination_layer
         hidden_left  = self._llm_partial_forward(self.llm_left,  embeds_left,  mask_left,  stop_layer=N + 1)
         hidden_right = self._llm_partial_forward(self.llm_right, embeds_right, mask_right, stop_layer=N + 1)
 
+        prefix_left = prefix_right = None
         if self.use_coordination:
-            hidden_left, hidden_right = self._apply_coordination_per_sample(hidden_left, hidden_right, action_starts)
+            prefix_left, prefix_right = self._build_cross_arm_prefix_memory(hidden_left, hidden_right)
+            hidden_left, hidden_right = self._apply_coordination_per_sample(hidden_left, hidden_right, action_spans)
 
         loss_left,  logits_left  = self._llm_final_forward(
-            self.llm_left,  hidden_left,  mask_left,  mm_labels_left,  start_layer=N + 1
+            self.llm_left,  hidden_left,  mask_left,  mm_labels_left,  start_layer=N + 1, prefix_memory=prefix_left
         )
         loss_right, logits_right = self._llm_final_forward(
-            self.llm_right, hidden_right, mask_right, mm_labels_right, start_layer=N + 1
+            self.llm_right, hidden_right, mask_right, mm_labels_right, start_layer=N + 1, prefix_memory=prefix_right
         )
 
         total_loss = (
-            (loss_left + loss_right)
+            0.5 * (loss_left + loss_right)
             if (loss_left is not None and loss_right is not None)
             else None
         )
@@ -900,16 +1243,21 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         mask_l = torch.ones(input_ids_left.shape,  dtype=torch.long, device=input_ids_left.device)
         mask_r = torch.ones(input_ids_right.shape, dtype=torch.long, device=input_ids_right.device)
 
-        embeds_left,  mask_left  = self._build_multimodal_embeds(
+        embeds_left, mask_left, visual_context_end_idx_left = self._build_multimodal_embeds(
             self.llm_left,  self.projector_left,  pixel_values_global, pixel_values_wrist_left,  input_ids_left,  mask_l
         )
-        embeds_right, mask_right = self._build_multimodal_embeds(
+        embeds_right, mask_right, visual_context_end_idx_right = self._build_multimodal_embeds(
             self.llm_right, self.projector_right, pixel_values_global, pixel_values_wrist_right, input_ids_right, mask_r
         )
+        if visual_context_end_idx_left != visual_context_end_idx_right:
+            raise ValueError(
+                f"left/right visual context lengths differ: left={visual_context_end_idx_left}, right={visual_context_end_idx_right}"
+            )
+        self.visual_context_end_idx = visual_context_end_idx_left
 
         assert mask_left.shape[0] == 1, "predict_action 只支持 batch size = 1"
 
-        action_start_idx = embeds_left.shape[1]
+        action_start_idx = embeds_left.shape[1] - 1
         B = mask_left.shape[0]
         N = self.coordination_layer
         generated_left, generated_right = [], []
@@ -917,13 +1265,22 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
         for _ in range(action_dim):
             h_left  = self._llm_partial_forward(self.llm_left,  embeds_left,  mask_left,  stop_layer=N + 1)
             h_right = self._llm_partial_forward(self.llm_right, embeds_right, mask_right, stop_layer=N + 1)
+            prefix_left = prefix_right = None
             if self.use_coordination:
-                h_left, h_right = self.coordination_module(h_left, h_right, action_start_idx)
-            _, logits_left  = self._llm_final_forward(self.llm_left,  h_left,  mask_left,  None, start_layer=N + 1)
-            _, logits_right = self._llm_final_forward(self.llm_right, h_right, mask_right, None, start_layer=N + 1)
+                prefix_left, prefix_right = self._build_cross_arm_prefix_memory(h_left, h_right)
+                action_end_idx = embeds_left.shape[1]
+                h_left, h_right = self.coordination_module(
+                    h_left, h_right, action_start_idx, action_end_idx, self.visual_context_end_idx
+                )
+            _, logits_left  = self._llm_final_forward(
+                self.llm_left,  h_left,  mask_left,  None, start_layer=N + 1, prefix_memory=prefix_left
+            )
+            _, logits_right = self._llm_final_forward(
+                self.llm_right, h_right, mask_right, None, start_layer=N + 1, prefix_memory=prefix_right
+            )
 
             # 只允许从合法 action token 里选，屏蔽文字 token 和 padding token
-            true_vocab_size = self.config.text_config.vocab_size  # 32000
+            true_vocab_size = self.vocab_size
             action_token_begin = true_vocab_size - (self.bin_centers.shape[0] + 1)
             logits_left[:,  -1, :action_token_begin] = float('-inf')
             logits_right[:, -1, :action_token_begin] = float('-inf')
@@ -946,7 +1303,7 @@ class CoordiVLAForActionPrediction(PrismaticPreTrainedModel):
 
     def _decode_action(self, token_ids, unnorm_key, arm):
         predicted   = np.array(token_ids)
-        true_vocab_size = self.config.text_config.vocab_size  # 32000
+        true_vocab_size = self.vocab_size
         discretized = np.clip(
             true_vocab_size - predicted - 1,
             a_min=0, a_max=self.bin_centers.shape[0] - 1

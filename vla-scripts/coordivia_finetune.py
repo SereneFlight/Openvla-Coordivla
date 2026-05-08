@@ -52,6 +52,7 @@ import wandb
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.vla.robotwin_action_utils import build_joint_delta_gripper_cont_abs, standardize_gripper_actions
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
@@ -60,6 +61,37 @@ from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.extern.hf.coordivla_configuration import CoordiVLAConfig
 from prismatic.extern.hf.coordivla_modeling import CoordiVLAForActionPrediction
+
+COORDINATION_METADATA_KEYS = (
+    "use_coordination",
+    "coordination_summary_tokens",
+    "coordination_num_layers",
+    "coordination_fusion",
+    "coordination_include_self_action_prefix",
+    "coordination_prefix_memory",
+    "train_projector",
+)
+
+TRAIN_PROJECTOR = True
+
+
+def write_coordination_metadata(model, save_dir) -> None:
+    """Persist coordination config next to the LoRA adapter for merge-time reconstruction."""
+    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+    metadata = {
+        key: getattr(base_model.config, key)
+        for key in COORDINATION_METADATA_KEYS
+        if hasattr(base_model.config, key)
+    }
+    config_path = Path(save_dir) / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            adapter_config = json.load(f)
+    else:
+        adapter_config = {}
+    adapter_config.update(metadata)
+    with open(config_path, "w") as f:
+        json.dump(adapter_config, f, indent=2)
 
 # === HuggingFace Auto 类注册 ===
 # 注册的作用：让 AutoConfig/AutoModel 通过 model_type 字符串找到对应的类
@@ -89,6 +121,14 @@ except ValueError:
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 IGNORE_INDEX = -100
+ACTION_ENCODING = "joint_delta_gripper_cont_abs"
+ACTION_MASK = np.array([True, True, True, True, True, True, False], dtype=bool)
+
+
+def normalize_action(action: np.ndarray, q01: np.ndarray, q99: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    normalized = 2 * (action - q01) / (q99 - q01 + 1e-8) - 1
+    normalized = np.clip(normalized, -1.0, 1.0)
+    return np.where(mask, normalized, action).astype(np.float32)
 
 
 # ============================================================
@@ -120,19 +160,30 @@ class RoboTwinDataset(Dataset):
         for hdf5_path in sorted(glob.glob(os.path.join(hdf5_dir, "episode*.hdf5"))):
             with h5py.File(hdf5_path, "r") as ep:
                 n_steps = ep["joint_action/left_arm"].shape[0]
-            for t in range(n_steps):
+            # obs[t] predicts the next recorded qpos target, so the last frame has no label.
+            for t in range(max(0, n_steps - 1)):
                 self.samples.append((hdf5_path, t))
 
         # 按唯一文件列表统计，避免按 self.samples 重复读同一文件 n_steps 次
         unique_files = sorted(set(hdf5_path for hdf5_path, _ in self.samples))
         all_left = []
         all_right = []
+        self.left_gripper_cache = {}
+        self.right_gripper_cache = {}
         for hdf5_path in unique_files:
             with h5py.File(hdf5_path, "r") as f:
-                lg = f["joint_action/left_gripper"][:]
-                rg = f["joint_action/right_gripper"][:]
-                left  = np.concatenate([f["joint_action/left_arm"][:],  lg.reshape(-1, 1)],  axis=1)
-                right = np.concatenate([f["joint_action/right_arm"][:], rg.reshape(-1, 1)], axis=1)
+                left_gripper = standardize_gripper_actions(f["joint_action/left_gripper"][:])
+                right_gripper = standardize_gripper_actions(f["joint_action/right_gripper"][:])
+                self.left_gripper_cache[hdf5_path] = left_gripper
+                self.right_gripper_cache[hdf5_path] = right_gripper
+                left = build_joint_delta_gripper_cont_abs(
+                    f["joint_action/left_arm"][:],
+                    left_gripper,
+                )
+                right = build_joint_delta_gripper_cont_abs(
+                    f["joint_action/right_arm"][:],
+                    right_gripper,
+                )
                 all_left.append(left)
                 all_right.append(right)
         all_left = np.concatenate(all_left, axis=0)  # (2*N*T, 7)
@@ -142,9 +193,10 @@ class RoboTwinDataset(Dataset):
                 "action": {
                     "lq01":  np.percentile(all_left, 1,  axis=0).astype(np.float32),
                     "lq99":  np.percentile(all_left, 99, axis=0).astype(np.float32),
-                    "mask": np.ones(7, dtype=bool),
+                    "mask": ACTION_MASK.copy(),
                     "rq01":  np.percentile(all_right, 1,  axis=0).astype(np.float32),
                     "rq99":  np.percentile(all_right, 99,  axis=0).astype(np.float32),
+                    "action_encoding": ACTION_ENCODING,
                 }
             }
         }
@@ -166,13 +218,15 @@ class RoboTwinDataset(Dataset):
             img_wrist_r = Image.open(io.BytesIO(bytes(ep["observation/right_camera/rgb"][t]))).convert("RGB")
 
             # 读取左右臂动作：arm(6) + gripper(1) = 7 维
+            left_gripper = self.left_gripper_cache[hdf5_path]
+            right_gripper = self.right_gripper_cache[hdf5_path]
             left_action = np.concatenate([
-                ep["joint_action/left_arm"][t],
-                np.array(ep["joint_action/left_gripper"][t]).reshape(1)
+                ep["joint_action/left_arm"][t + 1] - ep["joint_action/left_arm"][t],
+                np.array(left_gripper[t + 1]).reshape(1)
             ]).astype(np.float32)
             right_action = np.concatenate([
-                ep["joint_action/right_arm"][t],
-                np.array(ep["joint_action/right_gripper"][t]).reshape(1)
+                ep["joint_action/right_arm"][t + 1] - ep["joint_action/right_arm"][t],
+                np.array(right_gripper[t + 1]).reshape(1)
             ]).astype(np.float32)
 
         # 图像预处理（resize + 归一化），复用 OpenVLA 的 image_transform
@@ -207,8 +261,8 @@ class RoboTwinDataset(Dataset):
             labels[~action_mask] = IGNORE_INDEX
             return input_ids, labels
 
-        left_action_norm  = 2 * (left_action  - self.lq01) / (self.lq99 - self.lq01 + 1e-8) - 1
-        right_action_norm = 2 * (right_action - self.rq01) / (self.rq99 - self.rq01 + 1e-8) - 1
+        left_action_norm = normalize_action(left_action, self.lq01, self.lq99, ACTION_MASK)
+        right_action_norm = normalize_action(right_action, self.rq01, self.rq99, ACTION_MASK)
         input_ids_left,  labels_left  = build_ids_and_labels(left_action_norm)
         input_ids_right, labels_right = build_ids_and_labels(right_action_norm )
 
@@ -348,6 +402,11 @@ class FinetuneConfig:
     lora_rank: int = 32                                             # Rank of LoRA weight matrix
     lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
     use_coordination: bool = True                                   # 是否启用协调模块
+    coordination_summary_tokens: int = 16                           # 16 个 summary query；设为 0 则使用完整上下文
+    coordination_num_layers: int = 1                                # 小数据任务先用 1 层，避免协调模块参数过大
+    coordination_fusion: str = "meta_query"                         # meta_query: coordination prefix attention
+    coordination_include_self_action_prefix: bool = False            # False: 7x(16+7); True: 7x(16+7+7)
+    coordination_prefix_memory: bool = False                         # Carry cross-arm summary tokens through remaining LLM layers
     use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
                                                                     #   => CAUTION: Reduces memory but hurts performance
 
@@ -377,6 +436,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
     if cfg.use_lora:
         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+    if TRAIN_PROJECTOR:
+        exp_id += "+projector"
+    if cfg.use_coordination:
+        exp_id += f"+coord-{cfg.coordination_fusion}"
     if cfg.use_quantization:
         exp_id += "+q-4bit"
     if cfg.run_id_note is not None:
@@ -400,7 +463,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     processor = AutoProcessor.from_pretrained(cfg.openvla_path, trust_remote_code=True)
     vla = CoordiVLAForActionPrediction.from_single_arm_pretrained(
         cfg.openvla_path,
-        CoordiVLAConfig.from_pretrained(cfg.openvla_path, use_coordination=cfg.use_coordination),
+        CoordiVLAConfig.from_pretrained(
+            cfg.openvla_path,
+            use_coordination=cfg.use_coordination,
+            coordination_summary_tokens=cfg.coordination_summary_tokens,
+            coordination_num_layers=cfg.coordination_num_layers,
+            coordination_fusion=cfg.coordination_fusion,
+            coordination_include_self_action_prefix=cfg.coordination_include_self_action_prefix,
+            coordination_prefix_memory=cfg.coordination_prefix_memory,
+        ),
         torch_dtype=torch.bfloat16,
     )
 
@@ -441,35 +512,93 @@ def finetune(cfg: FinetuneConfig) -> None:
     base.llm_left.config.use_cache = False
     base.llm_right.config.use_cache = False
 
-    # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
-    vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
-
-    # 手动解冻 coordination_module / alpha，LoRA 默认不训练它们
-    use_coordination = vla.module.get_base_model().use_coordination if hasattr(vla, 'module') else vla.get_base_model().use_coordination
+    # DDP 初始化前先解冻 coordination_module，并让 alpha 保持 fp32。
+    # alpha 是标量门控；如果跟随模型转成 bf16，1e-4 量级更新会在 1.0 附近被舍入掉。
+    use_coordination = base.use_coordination
     if use_coordination:
+        # The coordination module is newly trained. Keep it in fp32 so AdamW updates
+        # do not get rounded away around small Xavier/query initializations.
+        coord_mod_base = base.coordination_module.to(torch.float32)
+        use_alpha_fusion = getattr(coord_mod_base, "fusion", "residual") == "residual"
+        if use_alpha_fusion:
+            coord_mod_base.alpha_left = torch.nn.Parameter(coord_mod_base.alpha_left.detach().float())
+            coord_mod_base.alpha_right = torch.nn.Parameter(coord_mod_base.alpha_right.detach().float())
         for n, p in vla.named_parameters():
             if 'coordination_module' in n:
                 p.requires_grad = True
+        if not use_alpha_fusion:
+            coord_mod_base.alpha_left.requires_grad = False
+            coord_mod_base.alpha_right.requires_grad = False
+        coord_param_count = sum(p.numel() for p in coord_mod_base.parameters())
+        coord_trainable_count = sum(p.numel() for p in coord_mod_base.parameters() if p.requires_grad)
+        print(f"coordination_module params: {coord_param_count:,} total, {coord_trainable_count:,} trainable, dtype=fp32")
+        if getattr(coord_mod_base, "fusion", "residual") == "meta_query":
+            print(
+                "coordination_include_self_action_prefix: "
+                f"{getattr(coord_mod_base, 'include_self_action_prefix', True)}"
+            )
+            print(
+                "coordination_prefix_memory: "
+                f"{getattr(base.config, 'coordination_prefix_memory', False)}"
+            )
+
+    base.config.train_projector = TRAIN_PROJECTOR
+    if TRAIN_PROJECTOR:
+        for n, p in vla.named_parameters():
+            if "projector_left" in n or "projector_right" in n:
+                p.requires_grad = True
+        projector_param_count = sum(
+            p.numel()
+            for n, p in base.named_parameters()
+            if "projector_left" in n or "projector_right" in n
+        )
+        projector_trainable_count = sum(
+            p.numel()
+            for n, p in base.named_parameters()
+            if ("projector_left" in n or "projector_right" in n) and p.requires_grad
+        )
+        print(
+            f"projector_left/right params: {projector_param_count:,} total, "
+            f"{projector_trainable_count:,} trainable"
+        )
+
+    # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
+    vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
+
+    if use_coordination:
         coord_mod_base = vla.module.get_base_model().coordination_module
 
-        # Create Optimizer，三个 param group（alpha 前1000步 lr=0，避免 DDP unused parameter 问题）
-        alpha_params = [coord_mod_base.alpha_left, coord_mod_base.alpha_right]
+        # Create optimizer. Alpha is only used by the legacy residual-fusion module.
+        use_alpha_fusion = getattr(coord_mod_base, "fusion", "residual") == "residual"
+        alpha_params = [coord_mod_base.alpha_left, coord_mod_base.alpha_right] if use_alpha_fusion else []
         coord_params = [p for n, p in vla.named_parameters()
                         if 'coordination_module' in n
                         and 'alpha_left' not in n and 'alpha_right' not in n
                         and p.requires_grad]
+        projector_params = [p for n, p in vla.named_parameters()
+                            if ('projector_left' in n or 'projector_right' in n)
+                            and p.requires_grad]
         lora_params  = [p for n, p in vla.named_parameters()
                         if 'coordination_module' not in n
+                        and 'projector_left' not in n and 'projector_right' not in n
                         and 'alpha_left' not in n and 'alpha_right' not in n
                         and p.requires_grad]
-        optimizer = AdamW([
+        param_groups = [
             {'params': lora_params,  'lr': cfg.learning_rate},
             {'params': coord_params, 'lr': cfg.learning_rate / 2},
-            {'params': alpha_params, 'lr': 0.0},  # 前1000步不更新
-        ])
+            {'params': projector_params, 'lr': cfg.learning_rate / 2},
+        ]
+        if use_alpha_fusion:
+            alpha_group_idx = len(param_groups)
+            param_groups.append({'params': alpha_params, 'lr': 0.0, 'weight_decay': 0.0})
+        else:
+            alpha_group_idx = None
+        optimizer = AdamW(param_groups)
+        print(f"coordination_fusion: {getattr(coord_mod_base, 'fusion', 'residual')}")
     else:
         lora_params = [p for p in vla.parameters() if p.requires_grad]
         optimizer = AdamW(lora_params, lr=cfg.learning_rate)
+        alpha_group_idx = None
     # 主干 LoRA：warmup + cosine decay
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=1e-8, end_factor=1.0, total_iters=cfg.warmup_steps
@@ -521,7 +650,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     recent_action_losses = deque(maxlen=cfg.grad_accumulation_steps)
     recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
-    recent_alpha_reg_losses = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Train!
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -547,14 +675,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     loss = output.loss
 
                 # Alpha 惩罚项：1000步后才加，冻结期间不干扰其他参数
-                alpha_reg_loss = torch.tensor(0.0, device=device_id)
-                if use_coordination and gradient_step_idx >= 1000:
-                    coord_mod = vla.module.get_base_model().coordination_module
-                    alpha_reg_loss = -0.1 * (coord_mod.alpha_left.clamp(min=0) + coord_mod.alpha_right.clamp(min=0))
-                total_loss = loss + alpha_reg_loss
-
                 # Normalize loss to account for gradient accumulation
-                normalized_loss = total_loss / cfg.grad_accumulation_steps
+                normalized_loss = loss / cfg.grad_accumulation_steps
 
                 # Backward pass
                 normalized_loss.backward()
@@ -593,17 +715,23 @@ def finetune(cfg: FinetuneConfig) -> None:
                 recent_action_losses.append(output.loss.item())
                 recent_action_accuracies.append(action_accuracy.item())
                 recent_l1_losses.append(action_l1_loss.item())
-                recent_alpha_reg_losses.append(alpha_reg_loss.item())
 
                 # Compute smoothened train metrics
                 smoothened_loss = sum(recent_losses) / len(recent_losses)
                 smoothened_action_loss = sum(recent_action_losses) / len(recent_action_losses)
                 smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
                 smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
-                smoothened_alpha_reg_loss = sum(recent_alpha_reg_losses) / len(recent_alpha_reg_losses)
 
                 # Optimizer Step
                 if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                    alpha_left_grad_value = None
+                    alpha_right_grad_value = None
+                    if use_coordination and use_alpha_fusion:
+                        if coord_mod_base.alpha_left.grad is not None:
+                            alpha_left_grad_value = coord_mod_base.alpha_left.grad.detach().float().item()
+                        if coord_mod_base.alpha_right.grad is not None:
+                            alpha_right_grad_value = coord_mod_base.alpha_right.grad.detach().float().item()
+
                     torch.nn.utils.clip_grad_norm_(vla.parameters(), cfg.max_grad_norm)
                     optimizer.step()
                     scheduler.step()
@@ -611,13 +739,13 @@ def finetune(cfg: FinetuneConfig) -> None:
                     gradient_step_idx += 1
 
                     # 1000步后激活 alpha lr（scheduler 会覆盖，每步强制设回）
-                    if use_coordination and gradient_step_idx >= 1000:
-                        optimizer.param_groups[2]['lr'] = cfg.learning_rate
-                    if use_coordination and gradient_step_idx == 1000:
+                    if use_coordination and use_alpha_fusion and gradient_step_idx >= 1000:
+                        optimizer.param_groups[alpha_group_idx]['lr'] = cfg.learning_rate
+                    if use_coordination and use_alpha_fusion and gradient_step_idx == 1000:
                         print("Step 1000: alpha lr activated")
-                    if use_coordination and gradient_step_idx == 1001:
-                        print(f"alpha_left grad: {coord_mod_base.alpha_left.grad}")
-                        print(f"alpha_right grad: {coord_mod_base.alpha_right.grad}")
+                    if use_coordination and use_alpha_fusion and gradient_step_idx == 1001:
+                        print(f"alpha_left grad before step: {alpha_left_grad_value}")
+                        print(f"alpha_right grad before step: {alpha_right_grad_value}")
                         print(f"alpha_left value: {coord_mod_base.alpha_left.item()}")
                     progress.update()
 
@@ -629,10 +757,17 @@ def finetune(cfg: FinetuneConfig) -> None:
                             "l1_loss": smoothened_l1_loss,
                         }
                         if use_coordination:
-                            log_dict["alpha_reg_loss"] = smoothened_alpha_reg_loss
                             coord_mod = vla.module.get_base_model().coordination_module
-                            log_dict["alpha_left"]  = coord_mod.alpha_left.item()
-                            log_dict["alpha_right"] = coord_mod.alpha_right.item()
+                            if use_alpha_fusion:
+                                log_dict["alpha_left"]  = coord_mod.alpha_left.item()
+                                log_dict["alpha_right"] = coord_mod.alpha_right.item()
+                                log_dict["alpha_lr"] = optimizer.param_groups[alpha_group_idx]["lr"]
+                            for stat_name, stat_value in coord_mod.get_coord_stats().items():
+                                log_dict[stat_name] = stat_value.float().item()
+                            if alpha_left_grad_value is not None:
+                                log_dict["alpha_left_grad"] = alpha_left_grad_value
+                            if alpha_right_grad_value is not None:
+                                log_dict["alpha_right_grad"] = alpha_right_grad_value
 
                             # 每 200 步记录一次 cross-attn 热力图
                             if gradient_step_idx % 200 == 0:
@@ -640,14 +775,19 @@ def finetune(cfg: FinetuneConfig) -> None:
                                 if lw is not None:
                                     for name, w in [("left_queries_right", lw), ("right_queries_left", rw)]:
                                         arr = w[0].float().cpu().numpy()
+                                        vmax = float(np.percentile(arr, 99))
+                                        if not np.isfinite(vmax) or vmax <= 0:
+                                            vmax = float(arr.max()) if arr.size else 1.0
+                                        vmax = max(vmax, 1e-6)
                                         fig, ax = plt.subplots(figsize=(4, 4))
-                                        im = ax.imshow(arr, aspect="auto", cmap="viridis", interpolation="nearest", extent=[0,1,1,0], vmin=0, vmax=1)
+                                        im = ax.imshow(arr, aspect="auto", cmap="viridis", interpolation="nearest", vmin=0, vmax=vmax)
                                         ax.set_xlabel("Key (source arm)")
                                         ax.set_ylabel("Query (target arm)")
-                                        ax.set_title(f"cross_attn/{name} step={gradient_step_idx}")
+                                        title_prefix = "prefix_attn" if getattr(coord_mod, "fusion", "residual") == "meta_query" else "cross_attn"
+                                        ax.set_title(f"{title_prefix}/{name} step={gradient_step_idx}, vmax={vmax:.2e}")
                                         plt.colorbar(im, ax=ax)
                                         plt.tight_layout()
-                                        log_dict[f"cross_attn/{name}"] = wandb.Image(fig)
+                                        log_dict[f"{title_prefix}/{name}"] = wandb.Image(fig)
                                         plt.close(fig)
                         wandb.log(log_dict, step=gradient_step_idx)
 
@@ -658,10 +798,19 @@ def finetune(cfg: FinetuneConfig) -> None:
                             save_dir = adapter_dir if cfg.use_lora else run_dir
                             processor.save_pretrained(run_dir)
                             vla.module.save_pretrained(save_dir)
+                            write_coordination_metadata(vla.module, save_dir)
                             if use_coordination:
                                 coord_state = vla.module.get_base_model().coordination_module.state_dict()
                                 torch.save(coord_state, f"{save_dir}/coordination_module.pt")
                                 print(f"Saved coordination_module weights to {save_dir}/coordination_module.pt")
+                            if TRAIN_PROJECTOR:
+                                base_model = vla.module.get_base_model()
+                                projector_state = {
+                                    "projector_left": base_model.projector_left.state_dict(),
+                                    "projector_right": base_model.projector_right.state_dict(),
+                                }
+                                torch.save(projector_state, f"{save_dir}/projector.pt")
+                                print(f"Saved projector weights to {save_dir}/projector.pt")
 
                         dist.barrier()
 
@@ -685,10 +834,19 @@ def finetune(cfg: FinetuneConfig) -> None:
         save_dir = adapter_dir if cfg.use_lora else run_dir
         processor.save_pretrained(run_dir)
         vla.module.save_pretrained(save_dir)
+        write_coordination_metadata(vla.module, save_dir)
         if use_coordination:
             coord_state = vla.module.get_base_model().coordination_module.state_dict()
             torch.save(coord_state, f"{save_dir}/coordination_module.pt")
             print(f"Saved coordination_module weights to {save_dir}/coordination_module.pt")
+        if TRAIN_PROJECTOR:
+            base_model = vla.module.get_base_model()
+            projector_state = {
+                "projector_left": base_model.projector_left.state_dict(),
+                "projector_right": base_model.projector_right.state_dict(),
+            }
+            torch.save(projector_state, f"{save_dir}/projector.pt")
+            print(f"Saved projector weights to {save_dir}/projector.pt")
     dist.barrier()
 
 
